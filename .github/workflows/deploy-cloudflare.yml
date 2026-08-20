@@ -1,0 +1,87 @@
+name: Deploy to Cloudflare
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance:
+        description: "Instance name (env file basename under cloudflare-worker/)"
+        required: false
+        default: "octafuse"
+      prefix:
+        description: "Cloudflare resource prefix (Workers + D1)"
+        required: false
+        default: "octafuse"
+      admin_only:
+        description: "Only rebuild/deploy the Admin Worker (e.g. after a Windows build fix)"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: deploy-cloudflare-${{ github.event.inputs.instance || 'octafuse' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      NODE_VERSION: "22"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies (clean, locked)
+        run: npm ci
+
+      - name: Wrangler whoami (auth check)
+        run: npx wrangler whoami
+
+      - name: Generate admin password if not provided
+        id: pw
+        run: |
+          if [ -n "${{ secrets.ADMIN_PASSWORD }}" ]; then
+            echo "value=${{ secrets.ADMIN_PASSWORD }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=$(openssl rand -hex 24)" >> "$GITHUB_OUTPUT"
+            echo "::warning::ADMIN_PASSWORD secret not set; generated a random password for this deploy. Reset it via Dashboard -> System -> Config after first login, or set the ADMIN_PASSWORD secret and re-run."
+          fi
+
+      # The instance env (cloudflare-worker/<instance>.env) must be committed in the repo.
+      # It already exists for 'octafuse' (created during local bootstrap). The Linux build
+      # fixes the chunk filenames that the Windows build produced.
+      - name: Deploy (migrate + upgrade both Workers)
+        if: ${{ github.event.inputs.admin_only != 'true' }}
+        env:
+          BOOTSTRAP_ADMIN_PASSWORD: ${{ steps.pw.outputs.value }}
+        run: |
+          INSTANCE="${{ github.event.inputs.instance || 'octafuse' }}"
+          test -f "cloudflare-worker/${INSTANCE}.env" || { echo "::error::cloudflare-worker/${INSTANCE}.env missing — commit it first"; exit 1; }
+          echo "Upgrading existing instance (Linux build fixes the Windows chunk bug)"
+          npm run deploy:cloudflare -- ${INSTANCE} --migrate
+
+      - name: Deploy Admin only (rebuild on Linux)
+        if: ${{ github.event.inputs.admin_only == 'true' }}
+        env:
+          BOOTSTRAP_ADMIN_PASSWORD: ${{ steps.pw.outputs.value }}
+        run: |
+          INSTANCE="${{ github.event.inputs.instance || 'octafuse' }}"
+          test -f "cloudflare-worker/${INSTANCE}.env" || { echo "::error::cloudflare-worker/${INSTANCE}.env missing"; exit 1; }
+          echo "Rebuilding Admin Worker on Linux"
+          npm run deploy:cloudflare -- ${INSTANCE} --admin-only
+
+      - name: Print one-time admin password (only if ADMIN_PASSWORD secret unset)
+        if: ${{ secrets.ADMIN_PASSWORD == '' }}
+        run: |
+          echo "::warning::One-time admin password for this deploy:"
+          echo "${{ steps.pw.outputs.value }}"
+          echo "::warning::Login at https://${{ github.event.inputs.prefix || 'octafuse' }}-admin.<account-subdomain>.workers.dev with username 'admin'. Rotate it immediately in the dashboard."
