@@ -4,6 +4,9 @@ import {
 	inferStaticProviderIconKey,
 	inferStaticProviderVendorKey,
 	listStaticProviderImportPresets,
+	lookupStaticProviderCatalogLinks,
+	providerCatalogOutboundRel,
+	resolveProviderCatalogOutbound,
 } from '@/lib/provider-import-preset';
 import type { ProviderEndpointsMap } from '@octafuse/core/provider-endpoints';
 
@@ -33,7 +36,12 @@ describe('provider import preset catalog metadata', () => {
 			(row) => row.name === 'Qwen AI Platform (Token Plan)'
 		);
 		assert.ok(qwenTokenPlan);
+		assert.equal(qwenTokenPlan.endpoints.dashscope?.base, undefined);
 		assert.deepEqual(qwenTokenPlan.endpoints.dashscope?.endpoints, {
+			'audio.transcriptions.multimodal':
+				'https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation',
+			'images.generations.multimodal':
+				'https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation',
 			'audio.speech':
 				'https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer',
 			'audio.realtime.inference':
@@ -55,6 +63,9 @@ describe('provider import preset catalog metadata', () => {
 			assert.match(row.catalog?.links?.platform ?? '', /^https:\/\//, row.name);
 			if (row.catalog?.links?.api_keys) {
 				assert.match(row.catalog.links.api_keys, /^https:\/\//, row.name);
+			}
+			if (row.catalog?.links?.referral) {
+				assert.match(row.catalog.links.referral, /^https:\/\//, row.name);
 			}
 		}
 	});
@@ -199,6 +210,19 @@ describe('provider import preset catalog metadata', () => {
 			chatOf('BytePlus ModelArk (Coding Plan)'),
 			'https://ark.ap-southeast.bytepluses.com/api/coding/v3/chat/completions'
 		);
+		assert.equal(chatOf('SCNet'), 'https://api.scnet.cn/api/llm/v1/chat/completions');
+		assert.equal(anthropicBaseOf('SCNet'), 'https://api.scnet.cn/api/llm/anthropic');
+		assert.equal(openaiBaseOf('SiliconFlow'), 'https://api.siliconflow.cn/v1');
+		assert.equal(
+			byName.get('SiliconFlow')?.catalog?.links?.referral,
+			'https://cloud.siliconflow.cn/i/rA30k5VJ'
+		);
+		assert.equal(openaiBaseOf('SiliconFlow (International)'), 'https://api.siliconflow.com/v1');
+		assert.equal(byName.get('SiliconFlow (International)')?.catalog?.links?.referral, undefined);
+		assert.equal(
+			byName.get('SiliconFlow (International)')?.catalog?.links?.platform,
+			'https://cloud.siliconflow.com/'
+		);
 	});
 
 	it('keeps Vertex Express on Gemini query-key and adds project-scoped OpenAI chat', () => {
@@ -240,5 +264,106 @@ describe('provider import preset catalog metadata', () => {
 
 		assert.equal(inferStaticProviderVendorKey(conflicting), 'other');
 		assert.equal(inferStaticProviderIconKey(conflicting), 'other');
+	});
+
+	it('overlays catalog links by template name or endpoint signature, preferring referral', () => {
+		const rows = listStaticProviderImportPresets();
+		const siliconflowChina = rows.find((row) => row.name === 'SiliconFlow');
+		const zen = rows.find((row) => row.name === 'OpenCode Zen');
+		const go = rows.find((row) => row.name === 'OpenCode Go');
+		assert.ok(siliconflowChina);
+		assert.ok(zen);
+		assert.ok(go);
+
+		assert.deepEqual(lookupStaticProviderCatalogLinks({ name: 'SiliconFlow (2)' }), {
+			platform: 'https://cloud.siliconflow.cn/',
+			api_keys: 'https://cloud.siliconflow.cn/account/ak',
+			referral: 'https://cloud.siliconflow.cn/i/rA30k5VJ',
+		});
+		assert.deepEqual(
+			lookupStaticProviderCatalogLinks({
+				name: 'Renamed production upstream',
+				endpoints: siliconflowChina.endpoints,
+			}),
+			lookupStaticProviderCatalogLinks({ name: 'SiliconFlow' })
+		);
+		assert.equal(
+			lookupStaticProviderCatalogLinks({
+				name: 'Private upstream',
+				endpoints: {
+					openai: { endpoints: { chat: 'https://example.com/v1/chat/completions' } },
+				},
+			}),
+			null
+		);
+
+		assert.equal(
+			lookupStaticProviderCatalogLinks({ name: zen.name })?.platform,
+			'https://opencode.ai/zen'
+		);
+		assert.equal(
+			lookupStaticProviderCatalogLinks({ name: go.name })?.platform,
+			'https://opencode.ai/go'
+		);
+
+		const outbound = resolveProviderCatalogOutbound(
+			lookupStaticProviderCatalogLinks({ name: 'SiliconFlow' })
+		);
+		assert.deepEqual(outbound, {
+			href: 'https://cloud.siliconflow.cn/i/rA30k5VJ',
+			kind: 'referral',
+		});
+		assert.deepEqual(resolveProviderCatalogOutbound(lookupStaticProviderCatalogLinks({ name: 'ZenMux' })), {
+			href: 'https://zenmux.ai/invite/PNWNOJ',
+			kind: 'referral',
+		});
+		assert.deepEqual(lookupStaticProviderCatalogLinks({ name: 'SiliconFlow' }), {
+			platform: 'https://cloud.siliconflow.cn/',
+			api_keys: 'https://cloud.siliconflow.cn/account/ak',
+			referral: 'https://cloud.siliconflow.cn/i/rA30k5VJ',
+		});
+		assert.deepEqual(lookupStaticProviderCatalogLinks({ name: 'SiliconFlow (International)' }), {
+			platform: 'https://cloud.siliconflow.com/',
+			api_keys: 'https://cloud.siliconflow.com/account/ak',
+		});
+		const siliconflowIntl = rows.find((row) => row.name === 'SiliconFlow (International)');
+		assert.ok(siliconflowIntl);
+		assert.deepEqual(
+			lookupStaticProviderCatalogLinks({
+				name: 'Renamed production upstream',
+				endpoints: siliconflowChina.endpoints,
+			}),
+			lookupStaticProviderCatalogLinks({ name: 'SiliconFlow' })
+		);
+		assert.deepEqual(
+			lookupStaticProviderCatalogLinks({
+				name: 'Renamed production upstream',
+				endpoints: siliconflowIntl.endpoints,
+			}),
+			lookupStaticProviderCatalogLinks({ name: 'SiliconFlow (International)' })
+		);
+		assert.deepEqual(
+			resolveProviderCatalogOutbound(lookupStaticProviderCatalogLinks({ name: 'SiliconFlow' })),
+			{
+				href: 'https://cloud.siliconflow.cn/i/rA30k5VJ',
+				kind: 'referral',
+			}
+		);
+		assert.equal(
+			resolveProviderCatalogOutbound(
+				lookupStaticProviderCatalogLinks({ name: 'SiliconFlow (International)' })
+			)?.kind,
+			'api_keys'
+		);
+		assert.equal(providerCatalogOutboundRel('referral'), 'sponsored noopener noreferrer');
+		assert.equal(
+			resolveProviderCatalogOutbound({
+				platform: 'https://example.com/',
+				api_keys: 'https://example.com/keys',
+			})?.kind,
+			'api_keys'
+		);
+		assert.equal(resolveProviderCatalogOutbound({ platform: 'https://example.com/' })?.kind, 'platform');
+		assert.equal(resolveProviderCatalogOutbound({ referral: 'http://insecure.example' }), null);
 	});
 });

@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
+import { useTranslations } from 'next-intl';
+import { useFeedback } from '@/components/feedback';
 import {
 	isAudioModel,
 	isImageGenerationModel,
@@ -38,8 +40,10 @@ import {
 	toggleRouteStatus,
 } from './route-api';
 import {
+	alignRouteScheduleWindowsToCatalog,
 	buildActiveFilterSummary,
 	buildFormDataFromRoute,
+	catalogScheduleWindowsFromModel,
 	buildRouteCardVendorGroups,
 	buildRoutePolicyPatch,
 	buildRoutesByModel,
@@ -62,6 +66,9 @@ import {
 } from './types';
 
 export function useRoutesPageState() {
+	const tModal = useTranslations('routes.modal');
+	const tCommon = useTranslations('common');
+	const { notify, confirm } = useFeedback();
 	const searchParams = useSearchParams();
 	const [routes, setRoutes] = useState<RouteListRow[]>([]);
 	const [models, setModels] = useState<GatewayModel[]>([]);
@@ -427,7 +434,13 @@ export function useRoutesPageState() {
 
 	const handleDelete = useCallback(
 		async (id: string) => {
-			if (!confirm('Are you sure you want to delete this route?')) return;
+			const ok = await confirm({
+				title: tModal('deleteRoute'),
+				message: tModal('confirmDelete'),
+				confirmLabel: tCommon('delete'),
+				danger: true,
+			});
+			if (!ok) return;
 
 			setIsDeleting(true);
 			try {
@@ -438,16 +451,16 @@ export function useRoutesPageState() {
 					setDuplicateSourceRouteId(null);
 					await refreshRoutesPage();
 				} else {
-					alert(result.message);
+					notify('error', result.message || tCommon('failed'));
 				}
 			} catch (error) {
 				console.error('Delete error:', error);
-				alert('Delete failed');
+				notify('error', tCommon('failed'));
 			} finally {
 				setIsDeleting(false);
 			}
 		},
-		[refreshRoutesPage]
+		[confirm, notify, refreshRoutesPage, tCommon, tModal]
 	);
 
 	const handleToggleStatus = useCallback(async (route: RouteListRow) => {
@@ -460,15 +473,15 @@ export function useRoutesPageState() {
 					prev.map((r) => (r.id === route.id ? { ...r, status: newStatus } : r))
 				);
 			} else {
-				alert(result.message);
+				notify('error', result.message || tCommon('updateFailed'));
 			}
 		} catch (error) {
 			console.error('Toggle status error:', error);
-			alert('Update failed, please try again');
+			notify('error', tCommon('updateFailed'));
 		} finally {
 			setTogglingId(null);
 		}
-	}, []);
+	}, [notify, tCommon]);
 
 	const copyModelId = useCallback(async (modelId: string) => {
 		try {
@@ -484,7 +497,16 @@ export function useRoutesPageState() {
 		setSaveError('');
 		setIsSaving(true);
 		try {
-			const result = await saveRoute(formData, editingRoute);
+			const catalog = catalogScheduleWindowsFromModel(
+				models.find((m) => m.id === formData.model_id)
+			);
+			const result = await saveRoute(
+				{
+					...formData,
+					schedule_windows: alignRouteScheduleWindowsToCatalog(catalog, formData.schedule_windows),
+				},
+				editingRoute
+			);
 			if (result.success) {
 				setShowModal(false);
 				setEditingRoute(null);
@@ -499,7 +521,7 @@ export function useRoutesPageState() {
 		} finally {
 			setIsSaving(false);
 		}
-	}, [editingRoute, formData, refreshRoutesPage]);
+	}, [editingRoute, formData, models, refreshRoutesPage]);
 
 	const handleOpenStrategyDialog = useCallback(
 		(

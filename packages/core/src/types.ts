@@ -13,9 +13,16 @@ export type ApiKeyBudgetAuditEventType =
 	| 'key_revoked'
 	| 'key_deleted'
 	| 'user_created'
-	| 'user_deleted';
+	| 'user_deleted'
+	| 'wallet_credit';
 
 export type ApiKeyBudgetAuditActorType = 'system' | 'admin' | 'service';
+
+/** `api_keys.rate_limit` / `users.rate_limit` JSON。NULL / 空对象 = 该层不限；后续可加 `rpd` 等维度。 */
+export type ApiKeyRateLimit = {
+	/** 从当前时刻回溯 60 秒的滚动窗口请求数。`0` 拒绝计次请求；省略表示该维度不限。 */
+	rpm?: number;
+};
 
 /** `api_keys` 表行（密钥明文存库；预算在 `users`）。 */
 export interface ApiKeyRow {
@@ -27,6 +34,8 @@ export interface ApiKeyRow {
 	/** JSON 字符串 */
 	metadata: string | null;
 	last_used_at: string | null;
+	/** JSON 对象；NULL = 不限 */
+	rate_limit: ApiKeyRateLimit | null;
 	created_at: string;
 	updated_at: string;
 }
@@ -40,8 +49,14 @@ export interface UserRow {
 	budget_spent: number;
 	budget_period: string;
 	budget_reset_at: string | null;
+	/** 累计发放的永久额度；余额为 granted − spent，不落列。 */
+	wallet_granted: number;
+	/** 累计消耗的永久额度。 */
+	wallet_spent: number;
 	status: string;
 	metadata: string | null;
+	/** JSON 对象；NULL = 该用户所有 Key 合计不限 */
+	rate_limit: ApiKeyRateLimit | null;
 	/** `{ "<models.id>": factor }` JSON；NULL 表示无用户级 Charged 折扣 */
 	charged_cost_factors: string | null;
 	external_system: string | null;
@@ -64,6 +79,10 @@ export interface ResolvedGatewayKeyRow extends ApiKeyRow {
 	budget_spent: number;
 	budget_period: string;
 	budget_reset_at: string | null;
+	wallet_granted: number;
+	wallet_spent: number;
+	/** `users.rate_limit`；NULL = 用户层不限 */
+	user_rate_limit: ApiKeyRateLimit | null;
 }
 
 /** `providers.status` 枚举。 */
@@ -134,7 +153,7 @@ export interface ModelRouteRow {
   /** 同 priority 层内权重；策略排序用，默认 1 */
   weight?: number;
   price_override: string | null;
-  /** 路由级默认请求体片段（JSON 对象字符串）；与用户请求体深度合并，用户字段优先 */
+  /** 路由级默认参数（JSON 对象字符串）。信封为 `{ headers, body, force_override }`；仍可读旧扁平对象。 */
   custom_params: string | null;
   /** `openai` | `anthropic` | `gemini` */
   upstream_protocol: string;
@@ -184,10 +203,12 @@ export interface RequestLogRow {
   total_tokens: number;
   /** 未乘路由倍率的原始 token 成本 */
   metered_cost: number;
-  /** 按 models 标准价格计算的 token 成本（不受 route price_override 影响） */
+  /** 官方当刻目录价（含 model 时段倍率），不含 route 倍率 */
   standard_cost: number;
   /** 计入用户预算与日志展示的费用 */
   charged_cost: number;
+  /** 本次请求从永久池扣掉的部分；周期部分 = charged_cost − charged_wallet_cost */
+  charged_wallet_cost: number;
   /** 请求当时选用的 `route_group` */
   route_group: string;
   status: string;
@@ -229,6 +250,8 @@ export interface RequestLogRow {
 	audio_duration_seconds: number | null;
 	/** TTS：上游返回的有效计费字符数 */
 	audio_characters: number | null;
+	/** 请求打到的入口 Host（只记录，不做准入） */
+	ingress_host: string | null;
   created_at: string;
 }
 

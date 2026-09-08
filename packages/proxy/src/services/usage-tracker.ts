@@ -1,16 +1,17 @@
 /**
- * 用量与计费：按百万 token 单价计算 `metered_cost`（供应成本）、`standard_cost`（目录标准成本）、`charged_cost`（用户预算）。
+ * 用量与计费：按百万 token 单价计算 `metered_cost`（供应成本）、`standard_cost`（官方当刻目录成本）、`charged_cost`（用户预算）。
  * - 基数始终来自 `models.pricing_profile`（按 input_tokens 选档）。
- * - `metered_cost` / `charged_cost` = 目录价 × 有效倍率（无 `schedule.mode` 时叠乘；`override` 时窗内用窗口 factor）。
- * - `standard_cost` = 目录价（不乘路由倍率）。
+ * - `standard_cost` = 目录价 × 官方时段倍率（不含路由倍率）。
+ * - `metered_cost` / `charged_cost` = 官方当刻价 × 路由有效倍率（无 `schedule.mode` 时叠乘；`override` 时窗内用窗口 factor）。
  * - nested `price_override.metered` / `charged` tiers 忽略不计价。
  * 写入 `api_key_request_logs`（含 `pricing_audit` JSON，见 `PRICING_AUDIT_JSON_SCHEMA_VERSION`）并在非 error 且 charged>0 时累加 `users.budget_spent`。
  */
-import type { GatewayRepositories, UpstreamProtocol } from '@octafuse/core';
+import type { GatewayRepositories } from '@octafuse/core';
 import {
 	getBusinessTimezone,
 	getUserBudgetSnapshot,
 	insertRequestUsageAndChargeTx,
+	parsePricingProfile,
 	parseRouteBaseFactors,
 	parseRoutePricingSchedule,
 	PRICING_AUDIT_JSON_SCHEMA_VERSION,
@@ -21,6 +22,7 @@ import {
 	resolveSupplierBillingPrices,
 	roundGatewayMoney,
 	scaleBillingPrices,
+	toScheduleAudit,
 	applyUserChargedCostFactor,
 	attachUserChargedFactorToPricingAudit,
 	lookupUserChargedCostFactor,
@@ -31,12 +33,12 @@ import {
 	computeChangedFields,
 	snapshotToJson,
 	snapshotWithOverrides,
+	splitChargeFromBudgetSnapshot,
 	userRowToSnapshot,
 } from '@octafuse/core';
-import type { UsageFromStream } from './proxy';
+import type { RecordUsageParams } from './accounting/types';
 import { fireGatewayErrorWebhooks } from './alert-webhook';
-import type { GatewayCircuitAlertEvent } from './circuit-alert-types';
-import type { RequestTimingSnapshot } from './request-timing';
+import type { UsageFromStream } from './proxy';
 
 const TOKENS_PER_MILLION = 1_000_000;
 
@@ -100,15 +102,7 @@ function applyRouteFactorsToSide(options: {
 			...options.catalog.audit,
 			source: 'model_x_factor',
 			base_factor: options.baseFactor,
-			schedule: {
-				timezone: sch.timezone,
-				local_time: sch.localTime,
-				evaluated_at_utc: sch.evaluatedAtUtc,
-				factor: sch.factor,
-				window: sch.window
-					? { start: sch.window.start, end: sch.window.end, factor: sch.window.factor }
-					: null,
-			},
+			schedule: toScheduleAudit(sch),
 			effective_factor: effective,
 			prices,
 		},
@@ -120,61 +114,7 @@ function applyRouteFactorsToSide(options: {
  */
 export async function recordUsage(
 	repos: GatewayRepositories,
-	params: {
-		api_key_id: string;
-		user_id: string;
-		user_email: string | null;
-		model_id: string;
-		provider_id: string;
-		provider_model_name?: string | null;
-		model_name?: string | null;
-		provider_name?: string | null;
-		request_body?: string | null;
-		upstream_request_body?: string | null;
-		request_protocol: 'openai' | 'anthropic' | 'gemini';
-		request_operation?: string | null;
-		upstream_protocol: UpstreamProtocol;
-		upstream_operation?: string | null;
-		model_surface_id?: string | null;
-		route_pool_id?: string | null;
-		route_target_id?: string | null;
-		adapter?: string | null;
-		/** Gemini wire action from URL (`generateContent` / `streamGenerateContent`); stored in route_trace. */
-		gemini_wire_action?: string | null;
-		/** Provider sticky routing observation (merged into route_trace.sticky). */
-		sticky_trace?: {
-			lookup: string;
-			attempted_target: string | null;
-			result: string;
-		} | null;
-		usage: UsageFromStream;
-		model_pricing_profile?: string | null;
-		route_price_override_json?: string | null;
-		/** `users.charged_cost_factors` JSON；按 `model_id` 精确匹配后再乘路由 charged */
-		user_charged_cost_factors_json?: string | null;
-		/** @deprecated Ignored; nested metered tiers are not used for billing. */
-		route_metered_profile_json?: string | null;
-		/** @deprecated Ignored; nested charged tiers are not used for billing. */
-		route_charged_profile_json?: string | null;
-		/** 请求进入 Gateway 的时间；每日时段倍率在该时刻锁定。 */
-		request_started_at_ms?: number;
-		route_group: string;
-		status: 'success' | 'error' | 'incomplete' | 'cancelled';
-		latency_ms?: number;
-		timing?: RequestTimingSnapshot | null;
-		error_message?: string;
-		provider_key_id?: string | null;
-		provider_key_label?: string | null;
-		provider_key_fingerprint?: string | null;
-		/** 上游响应头 request id（传输层追踪，见 `upstream-request-id.ts`） */
-		upstream_request_id?: string | null;
-		/** 上游响应 body message id（应用层生成结果 id：chatcmpl-* / msg_* / responseId） */
-		upstream_message_id?: string | null;
-		/** 本次错误关联的熔断事件（展示在 webhook 告警中） */
-		circuit_events?: GatewayCircuitAlertEvent[];
-		/** 已有熔断短路等场景：写日志但不发 webhook */
-		suppress_error_alert?: boolean;
-	}
+	params: RecordUsageParams
 ): Promise<void> {
 	const basis = params.usage.input_tokens;
 	const requestStartedAtMs = params.request_started_at_ms;
@@ -190,18 +130,31 @@ export async function recordUsage(
 	const schedule = parseRoutePricingSchedule(params.route_price_override_json ?? null);
 	const chargedSch = resolveDailyScheduleFactor(schedule.charged, pricingAtUtc, businessTimezone);
 	const meteredSch = resolveDailyScheduleFactor(schedule.metered, pricingAtUtc, businessTimezone);
+	const catalogProfile = parsePricingProfile(params.model_pricing_profile ?? null);
+	const catalogSch = resolveDailyScheduleFactor(
+		catalogProfile?.schedule ?? [],
+		pricingAtUtc,
+		businessTimezone
+	);
+	const catalogSchedule = toScheduleAudit(catalogSch);
 
 	const catalogSupplier = resolveSupplierBillingPrices({
 		basisInputTokens: basis,
 		modelPricingProfileJson: params.model_pricing_profile ?? null,
+		catalogScheduleFactor: catalogSch.factor,
+		catalogSchedule,
 	});
 	const standardResolved = resolveStandardBillingPrices({
 		basisInputTokens: basis,
 		modelPricingProfileJson: params.model_pricing_profile ?? null,
+		catalogScheduleFactor: catalogSch.factor,
+		catalogSchedule,
 	});
 	const catalogCharged = resolveChargedBillingPrices({
 		basisInputTokens: basis,
 		modelPricingProfileJson: params.model_pricing_profile ?? null,
+		catalogScheduleFactor: catalogSch.factor,
+		catalogSchedule,
 	});
 
 	const supplierResolved = applyRouteFactorsToSide({
@@ -265,16 +218,20 @@ export async function recordUsage(
 	console.log(
 		`[Gateway Usage] recordUsage model_id=${params.model_id} request_protocol=${params.request_protocol} status=${params.status} route_group=${params.route_group} input_tokens=${params.usage.input_tokens} output_tokens=${params.usage.output_tokens} reasoning_tokens=${params.usage.reasoning_tokens} metered=${supplierCostR} standard=${standardCostR} charged=${chargedCost} charged_eff=${chargedResolved.audit.effective_factor} user_charged_factor=${userChargedFactor ?? 'none'} metered_eff=${supplierResolved.audit.effective_factor}`
 	);
-	const id = crypto.randomUUID();
+	const id = params.requestLogId;
 	const shouldChargeBudget = params.status !== 'error' && chargedCost > 0;
 	const userSnapshot = shouldChargeBudget ? await getUserBudgetSnapshot(repos, params.user_id) : null;
 	const beforeSpent = userSnapshot?.budgetSpent ?? 0;
+	const split = splitChargeFromBudgetSnapshot(userSnapshot, chargedCost);
 	const userRow = shouldChargeBudget ? await repos.users.getById(params.user_id) : null;
-	const afterSpentVal = roundGatewayMoney(beforeSpent + chargedCost);
+	const afterSpentVal = split.afterPeriodSpent;
 	let usageSnaps: { before: string; after: string; changed: string | null } | null = null;
 	if (userRow) {
 		const beforeS = userRowToSnapshot(userRow);
-		const afterS = snapshotWithOverrides(beforeS, { budget_spent: afterSpentVal });
+		const afterS = snapshotWithOverrides(beforeS, {
+			budget_spent: afterSpentVal,
+			wallet_spent: roundGatewayMoney(Number(userRow.wallet_spent ?? 0) + split.fromWallet),
+		});
 		usageSnaps = {
 			before: snapshotToJson(beforeS),
 			after: snapshotToJson(afterS),
@@ -321,6 +278,7 @@ export async function recordUsage(
 			meteredCost: supplierCostR,
 			standardCost: standardCostR,
 			chargedCost: chargedCost,
+			chargedWalletCost: split.fromWallet,
 			routeGroup: params.route_group,
 			status: params.status,
 			latencyMs: params.latency_ms ?? null,
@@ -341,10 +299,12 @@ export async function recordUsage(
 			providerKeyFingerprint: params.provider_key_fingerprint ?? null,
 			upstreamRequestId: params.upstream_request_id ?? null,
 			upstreamMessageId: params.upstream_message_id ?? null,
+			ingressHost: params.ingress_host ?? null,
 		},
 		shouldChargeBudget,
 		beforeSpent,
 		chargedCost,
+		chargedFromWallet: split.fromWallet,
 		audit: {
 			apiKeyId: params.api_key_id,
 			eventType: 'usage_charge',

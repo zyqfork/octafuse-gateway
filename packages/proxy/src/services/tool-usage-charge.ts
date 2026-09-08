@@ -3,13 +3,17 @@
  */
 import {
 	buildFixedToolCostPricingAudit,
+	canAffordTotalCost,
 	changedFieldsToJson,
 	computeChangedFields,
+	computeTotalRemaining,
 	getUserBudgetSnapshot,
+	hasPositiveTotalBalance,
 	insertRequestUsageAndChargeTx,
 	roundGatewayMoney,
 	snapshotToJson,
 	snapshotWithOverrides,
+	splitChargeFromBudgetSnapshot,
 	userRowToSnapshot,
 	type GatewayRepositories,
 	type ToolUnitPrices,
@@ -43,6 +47,8 @@ export type ChargeToolUsageParams = {
 	responseBody?: string | null;
 	errorMessage?: string | null;
 	status: 'success' | 'error';
+	/** Request Host (observe only) */
+	ingressHost?: string | null;
 	/** pricing_audit 计费单位；默认 request */
 	pricingUnit?: 'request' | 'chars';
 	/** 计费单元数；默认 1 */
@@ -97,12 +103,16 @@ export async function chargeToolUsage(params: ChargeToolUsageParams): Promise<{ 
 	const id = crypto.randomUUID();
 	const userSnapshot = shouldChargeBudget ? await getUserBudgetSnapshot(params.repos, params.userId) : null;
 	const beforeSpent = userSnapshot?.budgetSpent ?? 0;
+	const split = splitChargeFromBudgetSnapshot(userSnapshot, chargedCost);
 	const userRow = shouldChargeBudget ? await params.repos.users.getById(params.userId) : null;
-	const afterSpentVal = roundGatewayMoney(beforeSpent + chargedCost);
+	const afterSpentVal = split.afterPeriodSpent;
 	let usageSnaps: { before: string; after: string; changed: string | null } | null = null;
 	if (userRow) {
 		const beforeS = userRowToSnapshot(userRow);
-		const afterS = snapshotWithOverrides(beforeS, { budget_spent: afterSpentVal });
+		const afterS = snapshotWithOverrides(beforeS, {
+			budget_spent: afterSpentVal,
+			wallet_spent: roundGatewayMoney(Number(userRow.wallet_spent ?? 0) + split.fromWallet),
+		});
 		usageSnaps = {
 			before: snapshotToJson(beforeS),
 			after: snapshotToJson(afterS),
@@ -140,16 +150,19 @@ export async function chargeToolUsage(params: ChargeToolUsageParams): Promise<{ 
 			meteredCost,
 			standardCost,
 			chargedCost,
+			chargedWalletCost: split.fromWallet,
 			routeGroup: 'default',
 			status: params.status,
 			latencyMs: params.latencyMs,
 			errorMessage: params.errorMessage ?? null,
 			rawUsage: params.responseBody ?? null,
 			pricingAudit: JSON.stringify(pricingAudit),
+			ingressHost: params.ingressHost ?? null,
 		},
 		shouldChargeBudget,
 		beforeSpent,
 		chargedCost,
+		chargedFromWallet: split.fromWallet,
 		audit: {
 			apiKeyId: params.apiKeyId,
 			eventType: 'usage_charge',
@@ -176,15 +189,50 @@ export async function chargeToolUsage(params: ChargeToolUsageParams): Promise<{ 
 	return { requestLogId: id, chargedCost };
 }
 
-/** 预检：当前额度是否够支付固定费用（budget_max 为 null 表示不限）。仅看 charged。 */
+type AffordPools = {
+	budgetMax: number | null;
+	budgetSpent: number;
+	walletGranted?: number;
+	walletSpent?: number;
+};
+
+/** 预检：总余额是否够支付固定费用（budget_max 为 null 表示不限）。 */
+export function canAffordToolCost(totalRemaining: number | null, toolCost: number): boolean;
 export function canAffordToolCost(
 	budgetMax: number | null,
 	budgetSpent: number,
-	toolCost: number
+	toolCost: number,
+	walletGranted?: number,
+	walletSpent?: number
+): boolean;
+export function canAffordToolCost(
+	a: number | null,
+	b: number,
+	c?: number,
+	walletGranted = 0,
+	walletSpent = 0
 ): boolean {
-	if (budgetMax == null) {
-		return true;
+	if (c === undefined) {
+		if (a == null) return true;
+		return roundGatewayMoney(b) <= roundGatewayMoney(a);
 	}
-	const cost = roundGatewayMoney(toolCost);
-	return roundGatewayMoney(budgetSpent + cost) <= roundGatewayMoney(budgetMax);
+	return canAffordTotalCost(a, b, walletGranted, walletSpent, c);
+}
+
+export function apiKeyTotalRemaining(apiKey: AffordPools): number | null {
+	return computeTotalRemaining(
+		apiKey.budgetMax,
+		apiKey.budgetSpent,
+		apiKey.walletGranted ?? 0,
+		apiKey.walletSpent ?? 0
+	);
+}
+
+export function apiKeyHasBalance(apiKey: AffordPools): boolean {
+	return hasPositiveTotalBalance(
+		apiKey.budgetMax,
+		apiKey.budgetSpent,
+		apiKey.walletGranted ?? 0,
+		apiKey.walletSpent ?? 0
+	);
 }

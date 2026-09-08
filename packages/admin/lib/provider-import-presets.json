@@ -311,6 +311,8 @@
 			},
 			"dashscope": {
 				"endpoints": {
+					"audio.transcriptions.multimodal": "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+					"images.generations.multimodal": "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
 					"audio.speech": "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer",
 					"audio.realtime.inference": "wss://token-plan.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference",
 					"audio.realtime.session": "wss://token-plan.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime"
@@ -320,16 +322,16 @@
 				"base": "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic"
 			}
 		},
-		"description": "Qwen AI Platform Token Plan (personal/team) OpenAI chat + DashScope TTS + Anthropic base; audio endpoints are limited to qwen-audio-3.0-tts-plus and qwen-audio-3.0-realtime-plus. Plan keys (sk-sp-*). Do not mix with pay-as-you-go dashscope.aliyuncs.com or Coding Plan coding.dashscope.aliyuncs.com. See platform.qianwenai.com Token Plan docs.",
+		"description": "Qwen AI Platform Token Plan (personal/team) OpenAI chat + DashScope TTS/realtime/image + Anthropic base; includes qwen-audio-3.0-asr-flash sync HTTP and DashScope image generation via multimodal-generation. Does not include filetrans HTTP. Plan keys (sk-sp-*). Do not mix with pay-as-you-go dashscope.aliyuncs.com or Coding Plan coding.dashscope.aliyuncs.com. See platform.qianwenai.com Token Plan docs.",
 		"catalog": {
 			"i18n": {
 				"zh": {
 					"name": "千问 AI 平台（Token Plan）",
-					"description": "千问 Token Plan 个人版与团队版端点，支持 OpenAI、DashScope TTS 与 Anthropic 协议。"
+					"description": "千问 Token Plan 个人版与团队版端点，支持 OpenAI、DashScope TTS / 实时语音 / 生图与 Anthropic 协议，以及 qwen-audio-3.0-asr-flash 同步 HTTP；不含 filetrans 异步转写。"
 				},
 				"en": {
 					"name": "Qwen AI Platform (Token Plan)",
-					"description": "Personal and team Token Plan endpoints for OpenAI, DashScope TTS, and Anthropic protocols."
+					"description": "Personal and team Token Plan endpoints for OpenAI, DashScope TTS/realtime/image, and Anthropic protocols. Includes qwen-audio-3.0-asr-flash sync HTTP and DashScope image generation. Does not include filetrans HTTP."
 				}
 			},
 			"links": {
@@ -1527,7 +1529,39 @@
 			},
 			"links": {
 				"platform": "https://zenmux.ai/",
-				"api_keys": "https://zenmux.ai/platform"
+				"api_keys": "https://zenmux.ai/platform",
+				"referral": "https://zenmux.ai/invite/PNWNOJ"
+			}
+		}
+	},
+	{
+		"name": "SCNet",
+		"vendor_key": "scnet",
+		"endpoints": {
+			"openai": {
+				"endpoints": {
+					"chat": "https://api.scnet.cn/api/llm/v1/chat/completions"
+				}
+			},
+			"anthropic": {
+				"base": "https://api.scnet.cn/api/llm/anthropic"
+			}
+		},
+		"description": "SCNet (National Supercomputing Internet) OpenAI chat + Anthropic Messages. Pay-as-you-go (sk-), Token Plan (sk-tp-), and Coding Plan (sk-sp-) share these endpoints—do not mix keys. Token Plan keys are intended for interactive AI tools, not backend batch APIs. See scnet.cn OpenAPI docs.",
+		"catalog": {
+			"i18n": {
+				"zh": {
+					"name": "超算互联网 SCNet",
+					"description": "国家超算互联网模型 API，支持 OpenAI 与 Anthropic 兼容协议。"
+				},
+				"en": {
+					"name": "SCNet",
+					"description": "National Supercomputing Internet model API with OpenAI- and Anthropic-compatible endpoints."
+				}
+			},
+			"links": {
+				"platform": "https://www.scnet.cn/ui/mall/",
+				"api_keys": "https://www.scnet.cn/ui/llm/apikeys"
 			}
 		}
 	},
@@ -1539,20 +1573,48 @@
 				"base": "https://api.siliconflow.cn/v1"
 			}
 		},
+		"description": "China SiliconFlow Model Cloud (api.siliconflow.cn). Do not mix with international api.siliconflow.com keys or cloud.siliconflow.com accounts.",
 		"catalog": {
 			"i18n": {
 				"zh": {
 					"name": "硅基流动",
-					"description": "硅基流动模型云的 OpenAI 兼容 API。"
+					"description": "硅基流动国内站的 OpenAI 兼容 API。"
 				},
 				"en": {
 					"name": "SiliconFlow",
-					"description": "SiliconFlow Model Cloud’s OpenAI-compatible API."
+					"description": "SiliconFlow China Model Cloud’s OpenAI-compatible API."
 				}
 			},
 			"links": {
 				"platform": "https://cloud.siliconflow.cn/",
-				"api_keys": "https://cloud.siliconflow.cn/account/ak"
+				"api_keys": "https://cloud.siliconflow.cn/account/ak",
+				"referral": "https://cloud.siliconflow.cn/i/rA30k5VJ"
+			}
+		}
+	},
+	{
+		"name": "SiliconFlow (International)",
+		"vendor_key": "siliconflow",
+		"endpoints": {
+			"openai": {
+				"base": "https://api.siliconflow.com/v1"
+			}
+		},
+		"description": "International SiliconFlow (api.siliconflow.com / cloud.siliconflow.com). Not for mainland China accounts; do not mix with api.siliconflow.cn keys.",
+		"catalog": {
+			"i18n": {
+				"zh": {
+					"name": "硅基流动（国际站）",
+					"description": "硅基流动国际站的 OpenAI 兼容 API。"
+				},
+				"en": {
+					"name": "SiliconFlow (International)",
+					"description": "SiliconFlow’s international Model Cloud OpenAI-compatible API."
+				}
+			},
+			"links": {
+				"platform": "https://cloud.siliconflow.com/",
+				"api_keys": "https://cloud.siliconflow.com/account/ak"
 			}
 		}
 	},

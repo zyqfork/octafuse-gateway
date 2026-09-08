@@ -7,8 +7,10 @@ import {
 	isDashScopeRealtimeAsrModelOperationCompatible,
 	isRouteAdapterCompatible,
 	isRequestOperationForProtocol,
+	normalizeRouteCustomParamsForStorage,
 	normalizeRouteOperation,
 	PASSTHROUGH_ROUTE_ADAPTER,
+	validateRouteCustomParamsHeaders,
 } from '@octafuse/core';
 import { isImageGenerationModel } from '@octafuse/core/db/model-modalities';
 import { normalizeUpstreamProtocol } from '@octafuse/core/upstream-protocol';
@@ -17,7 +19,11 @@ import { normalizeRoutePoolTierStrategiesInput } from '@octafuse/core/db/route-p
 import { buildAffinityKey, hashAffinityKey } from '@octafuse/core/db/route-affinity-key';
 import { normalizeStickyRoutingInput } from '@octafuse/core/db/route-pool-sticky-types';
 import { badRequest, notFound } from './errors';
-import { coerceRoutePriceOverrideInput, assertRoutePriceOverrideFactors } from './pricing-input';
+import {
+	assertRoutePriceOverrideFactors,
+	assertRoutePriceOverrideMatchesCatalog,
+	coerceRoutePriceOverrideInput,
+} from './pricing-input';
 import { normalizeJsonObjectField, providerSupportsUpstreamProtocol } from './shared';
 import { listAdminUsers, resolveAdminUserId } from './users-service';
 import type {
@@ -26,8 +32,41 @@ import type {
 	AdminModelRouteRow,
 } from './types';
 
-/** Image-generation catalog models may only use OpenAI Images–compatible routes. */
-async function assertImageModelOpenaiProtocol(
+function assertCustomParamsHeaders(serialized: string | null): void {
+	if (!serialized) return;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(serialized) as unknown;
+	} catch {
+		throw badRequest('custom_params must be valid JSON');
+	}
+	if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+		throw badRequest('custom_params must be a JSON object');
+	}
+	const result = validateRouteCustomParamsHeaders(parsed as Record<string, unknown>);
+	if (!result.ok) throw badRequest(result.message);
+}
+
+function normalizeCustomParamsForStorage(raw: unknown): string | null {
+	const normalized = normalizeJsonObjectField(raw, 'custom_params');
+	if (!normalized.ok) throw badRequest(normalized.message);
+	if (!normalized.value) return null;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(normalized.value) as unknown;
+	} catch {
+		throw badRequest('custom_params must be valid JSON');
+	}
+	if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+		throw badRequest('custom_params must be a JSON object');
+	}
+	assertCustomParamsHeaders(normalized.value);
+	const envelope = normalizeRouteCustomParamsForStorage(parsed as Record<string, unknown>);
+	return envelope ? JSON.stringify(envelope) : null;
+}
+
+/** Image models keep an OpenAI public entry; upstream may be OpenAI passthrough or DashScope conversion. */
+async function assertImageModelUpstreamProtocol(
 	repos: GatewayRepositories,
 	modelId: string,
 	proto: UpstreamProtocol
@@ -39,10 +78,11 @@ async function assertImageModelOpenaiProtocol(
 			output_modalities: model.output_modalities as string | null | undefined,
 			pricing_profile: model.pricing_profile as string | null | undefined,
 		}) &&
-		proto !== 'openai'
+		proto !== 'openai' &&
+		proto !== 'dashscope'
 	) {
 		throw badRequest(
-			'Image-generation models require upstream_protocol=openai (Gateway Images API only uses OpenAI routes).'
+			'Image-generation models require upstream_protocol=openai or dashscope (OpenAI Images passthrough or DashScope conversion).'
 		);
 	}
 }
@@ -106,8 +146,7 @@ export async function createModelRouteService(
 		throw badRequest('model_id, provider_id, and provider_model_name are required');
 	}
 
-	const customParamsNorm = normalizeJsonObjectField(body.custom_params, 'custom_params');
-	if (!customParamsNorm.ok) throw badRequest(customParamsNorm.message);
+	const customParams = normalizeCustomParamsForStorage(body.custom_params);
 
 	let proto: UpstreamProtocol;
 	try {
@@ -121,7 +160,7 @@ export async function createModelRouteService(
 	if (!providerSupportsUpstreamProtocol(proto, provider)) {
 		throw badRequest(`Provider has no base URL for upstream protocol "${proto}".`);
 	}
-	await assertImageModelOpenaiProtocol(repos, modelId, proto);
+	await assertImageModelUpstreamProtocol(repos, modelId, proto);
 
 	const routeGroup =
 		typeof body.route_group === 'string' && body.route_group.trim() !== '' ? body.route_group.trim() : 'default';
@@ -177,6 +216,10 @@ export async function createModelRouteService(
 	const id = crypto.randomUUID();
 	const priceOverride = coerceRoutePriceOverrideInput(body.price_override);
 	assertRoutePriceOverrideFactors(priceOverride);
+	const catalogModel = await repos.modelRouting.getModelById(modelId);
+	if (catalogModel) {
+		assertRoutePriceOverrideMatchesCatalog(catalogModel.pricing_profile, priceOverride);
+	}
 
 	const weightRaw = body.weight;
 	const weight =
@@ -197,7 +240,7 @@ export async function createModelRouteService(
 		status: String(body.status ?? 'active'),
 		routeGroup,
 		priceOverride,
-		customParams: customParamsNorm.value,
+		customParams,
 		upstreamProtocol: proto,
 		routePoolId: topology.poolId,
 		upstreamOperation,
@@ -227,10 +270,9 @@ export async function updateModelRouteService(
 	delete patch.id;
 	delete patch.request_protocol;
 	delete patch.request_operation;
+	delete patch.custom_params_force_override;
 	if (patch.custom_params !== undefined) {
-		const normalized = normalizeJsonObjectField(patch.custom_params, 'custom_params');
-		if (!normalized.ok) throw badRequest(normalized.message);
-		patch.custom_params = normalized.value;
+		patch.custom_params = normalizeCustomParamsForStorage(patch.custom_params);
 	}
 	if (patch.route_group !== undefined) {
 		const g = String(patch.route_group).trim();
@@ -274,7 +316,7 @@ export async function updateModelRouteService(
 	if (!providerSupportsUpstreamProtocol(effectiveProto, provider)) {
 		throw badRequest(`Provider has no base URL for upstream protocol "${effectiveProto}".`);
 	}
-	await assertImageModelOpenaiProtocol(repos, effectiveModelId, effectiveProto);
+	await assertImageModelUpstreamProtocol(repos, effectiveModelId, effectiveProto);
 
 	const requestProtocolRaw = body.request_protocol;
 	const requestOperationRaw = body.request_operation;
@@ -351,6 +393,15 @@ export async function updateModelRouteService(
 		patch.route_pool_id = topology.poolId;
 		patch.upstream_operation = effectiveUpstreamOperation;
 		patch.adapter = effectiveAdapter;
+	}
+
+	const effectivePriceOverride =
+		patch.price_override !== undefined
+			? (patch.price_override as string | null)
+			: existing.price_override;
+	const catalogModel = await repos.modelRouting.getModelById(effectiveModelId);
+	if (catalogModel) {
+		assertRoutePriceOverrideMatchesCatalog(catalogModel.pricing_profile, effectivePriceOverride);
 	}
 
 	const hasPatch = Object.values(patch).some((v) => v !== undefined);

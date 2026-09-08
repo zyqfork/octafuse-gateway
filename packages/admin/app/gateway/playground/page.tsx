@@ -120,6 +120,7 @@ function PlaygroundPageInner() {
 									selected={s.selected}
 									selectedUsesDashScopeRealtime={s.selectedUsesDashScopeRealtime}
 									imageSendBlocked={s.imageSendBlocked}
+									selectedImageUsesDashScope={s.selectedImageUsesDashScope}
 									audioSendBlocked={s.audioSendBlocked}
 									selectedIsImage={s.selectedIsImage}
 									selectedIsAudio={s.selectedIsAudio}
@@ -138,8 +139,7 @@ function PlaygroundPageInner() {
 									geminiAction={s.geminiAction}
 									onGeminiActionChange={s.setGeminiAction}
 									lastSentWireBody={s.lastSentWireBody}
-									wireOpen={s.wireOpen}
-									onWireOpenChange={s.setWireOpen}
+									lastSentWireHeaders={s.lastSentWireHeaders}
 								/>
 								<PlaygroundResponsePanel
 									responseMeta={s.responseMeta}

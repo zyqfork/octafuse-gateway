@@ -101,6 +101,7 @@ function recordRealtimeUsage(params: {
 					apiKeyId: apiKey.keyId,
 					userId: apiKey.userId,
 					userEmail: apiKey.userEmail,
+					ingressHost: apiKey.ingressHost,
 					modelId: baseModelId,
 					providerId: route.providerId,
 					providerModelName: route.providerModelName,
@@ -247,6 +248,7 @@ dashScopeRealtimeRoutes.get('/', async (c) => {
 			strategy: strategyPlan.base,
 			tierStrategies: strategyPlan.tierOverrides,
 			timing,
+			inboundHeaders: c.req.raw.headers,
 		}
 	);
 	const nodeUpgrade =

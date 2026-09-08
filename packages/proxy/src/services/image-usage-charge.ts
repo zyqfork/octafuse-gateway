@@ -28,9 +28,11 @@ import {
 	resolveSupplierBillingPrices,
 	roundGatewayMoney,
 	scaleBillingPrices,
+	toScheduleAudit,
 	applyUserChargedCostToBreakdown,
 	snapshotToJson,
 	snapshotWithOverrides,
+	splitChargeFromBudgetSnapshot,
 	userRowToSnapshot,
 	type ImageTokenUsage,
 	type ParsedPricingProfile,
@@ -51,7 +53,7 @@ export type ImageBillingParams = {
 	isEdit?: boolean;
 	/** edits / generations 参考图张数 */
 	referenceCount?: number;
-	/** 请求进入 Gateway 的时间；每日时段倍率在该时刻锁定 */
+	/** 请求进入 Gateway 的时间；分时时段倍率在该时刻锁定 */
 	requestStartedAtMs?: number;
 	operation?: 'generations' | 'edits';
 	/** 目录 `models.id`，用于查找用户 Charged 折扣 */
@@ -130,10 +132,13 @@ function pricingAtUtcFromParams(requestStartedAtMs?: number): Date {
 async function resolveRouteFactors(
 	repos: GatewayRepositories,
 	routePriceOverrideJson: string | null | undefined,
-	requestStartedAtMs?: number
+	requestStartedAtMs?: number,
+	modelPricingProfileJson?: string | null
 ): Promise<{
 	meteredFactor: number;
 	chargedFactor: number;
+	catalogFactor: number;
+	catalogSchedule: ReturnType<typeof toScheduleAudit>;
 	meteredAuditExtras: Pick<PriceResolutionAuditSide, 'base_factor' | 'schedule' | 'effective_factor'>;
 	chargedAuditExtras: Pick<PriceResolutionAuditSide, 'base_factor' | 'schedule' | 'effective_factor'>;
 }> {
@@ -143,6 +148,12 @@ async function resolveRouteFactors(
 	const schedule = parseRoutePricingSchedule(routePriceOverrideJson ?? null);
 	const chargedSch = resolveDailyScheduleFactor(schedule.charged, pricingAtUtc, businessTimezone);
 	const meteredSch = resolveDailyScheduleFactor(schedule.metered, pricingAtUtc, businessTimezone);
+	const catalogProfile = parsePricingProfile(modelPricingProfileJson ?? null);
+	const catalogSch = resolveDailyScheduleFactor(
+		catalogProfile?.schedule ?? [],
+		pricingAtUtc,
+		businessTimezone
+	);
 	const meteredFactor = resolveEffectiveRouteFactor(
 		baseFactors.meteredFactor,
 		meteredSch,
@@ -155,20 +166,14 @@ async function resolveRouteFactors(
 	);
 	const schSide = (sch: typeof chargedSch, base: number, effective: number) => ({
 		base_factor: base,
-		schedule: {
-			timezone: sch.timezone,
-			local_time: sch.localTime,
-			evaluated_at_utc: sch.evaluatedAtUtc,
-			factor: sch.factor,
-			window: sch.window
-				? { start: sch.window.start, end: sch.window.end, factor: sch.window.factor }
-				: null,
-		},
+		schedule: toScheduleAudit(sch),
 		effective_factor: effective,
 	});
 	return {
 		meteredFactor,
 		chargedFactor,
+		catalogFactor: catalogSch.factor,
+		catalogSchedule: toScheduleAudit(catalogSch),
 		meteredAuditExtras: schSide(meteredSch, baseFactors.meteredFactor, meteredFactor),
 		chargedAuditExtras: schSide(chargedSch, baseFactors.chargedFactor, chargedFactor),
 	};
@@ -219,14 +224,20 @@ function estimateImageTokenCosts(
 	const supplier = resolveSupplierBillingPrices({
 		basisInputTokens: basis,
 		modelPricingProfileJson: params.modelPricingProfileJson,
+		catalogScheduleFactor: factors.catalogFactor,
+		catalogSchedule: factors.catalogSchedule,
 	});
 	const standard = resolveStandardBillingPrices({
 		basisInputTokens: basis,
 		modelPricingProfileJson: params.modelPricingProfileJson,
+		catalogScheduleFactor: factors.catalogFactor,
+		catalogSchedule: factors.catalogSchedule,
 	});
 	const charged = resolveChargedBillingPrices({
 		basisInputTokens: basis,
 		modelPricingProfileJson: params.modelPricingProfileJson,
+		catalogScheduleFactor: factors.catalogFactor,
+		catalogSchedule: factors.catalogSchedule,
 	});
 
 	const supplierPrices = scaleBillingPrices(supplier.prices, factors.meteredFactor);
@@ -325,9 +336,10 @@ function estimateImagePerImageCosts(
 		outputUnitPrice,
 		inputUnitPrice,
 	});
-	const meteredCost = roundGatewayMoney(baseCost * factors.meteredFactor);
-	const standardCost = roundGatewayMoney(baseCost);
-	const chargedCost = roundGatewayMoney(baseCost * factors.chargedFactor);
+	const catalogBase = baseCost * factors.catalogFactor;
+	const meteredCost = roundGatewayMoney(catalogBase * factors.meteredFactor);
+	const standardCost = roundGatewayMoney(catalogBase);
+	const chargedCost = roundGatewayMoney(catalogBase * factors.chargedFactor);
 
 	const pricingAuditJson = JSON.stringify({
 		v: PRICING_AUDIT_JSON_SCHEMA_VERSION,
@@ -341,6 +353,7 @@ function estimateImagePerImageCosts(
 		...(params.operation ? { operation: params.operation } : {}),
 		metered_factor: factors.meteredFactor,
 		charged_factor: factors.chargedFactor,
+		catalog_schedule: factors.catalogSchedule,
 		...(options?.auditExtra ?? {}),
 	});
 
@@ -381,7 +394,8 @@ export async function estimateImageCosts(
 	const factors = await resolveRouteFactors(
 		repos,
 		params.routePriceOverrideJson,
-		params.requestStartedAtMs
+		params.requestStartedAtMs,
+		params.modelPricingProfileJson
 	);
 	const mode = resolveImageBillingMode(profile);
 
@@ -438,9 +452,11 @@ export async function estimateImageBudgetPrecheck(
 export function canAffordImageCost(
 	budgetMax: number | null,
 	budgetSpent: number,
-	chargedCost: number
+	chargedCost: number,
+	walletGranted = 0,
+	walletSpent = 0
 ): boolean {
-	return canAffordToolCost(budgetMax, budgetSpent, chargedCost);
+	return canAffordToolCost(budgetMax, budgetSpent, chargedCost, walletGranted, walletSpent);
 }
 
 /** 将 breakdown 标为未确认结果扣费审计（client abort / gateway timeout / 按请求张数）。 */
@@ -534,6 +550,8 @@ export type RecordImageUsageParams = {
 	timing?: RequestTimingSnapshot | null;
 	circuitEvents?: GatewayCircuitAlertEvent[];
 	suppressErrorAlert?: boolean;
+	/** Request Host (observe only) */
+	ingressHost?: string | null;
 };
 
 /**
@@ -572,7 +590,8 @@ export async function recordImageUsage(params: RecordImageUsageParams): Promise<
 		const factors = await resolveRouteFactors(
 			params.repos,
 			params.billing.routePriceOverrideJson,
-			params.billing.requestStartedAtMs
+			params.billing.requestStartedAtMs,
+			params.billing.modelPricingProfileJson
 		);
 		const billingKind =
 			mode === 'per_image' && profile && profileHasImagePerImagePricing(profile)
@@ -587,7 +606,8 @@ export async function recordImageUsage(params: RecordImageUsageParams): Promise<
 		const factors = await resolveRouteFactors(
 			params.repos,
 			params.billing.routePriceOverrideJson,
-			params.billing.requestStartedAtMs
+			params.billing.requestStartedAtMs,
+			params.billing.modelPricingProfileJson
 		);
 		costs = zeroImageCostBreakdown(params.billing, factors, 'image_tokens', {
 			error: 'request_failed',
@@ -596,7 +616,8 @@ export async function recordImageUsage(params: RecordImageUsageParams): Promise<
 		const factors = await resolveRouteFactors(
 			params.repos,
 			params.billing.routePriceOverrideJson,
-			params.billing.requestStartedAtMs
+			params.billing.requestStartedAtMs,
+			params.billing.modelPricingProfileJson
 		);
 		const auditExtra: Record<string, unknown> = { result_confirmed: params.resultConfirmed ?? true };
 		if (params.upstreamSupplierCostUsdTicks != null) {
@@ -648,12 +669,16 @@ export async function recordImageUsage(params: RecordImageUsageParams): Promise<
 		? await getUserBudgetSnapshot(params.repos, params.userId)
 		: null;
 	const beforeSpent = userSnapshot?.budgetSpent ?? 0;
+	const split = splitChargeFromBudgetSnapshot(userSnapshot, chargedCost);
 	const userRow = shouldChargeBudget ? await params.repos.users.getById(params.userId) : null;
-	const afterSpentVal = roundGatewayMoney(beforeSpent + chargedCost);
+	const afterSpentVal = split.afterPeriodSpent;
 	let usageSnaps: { before: string; after: string; changed: string | null } | null = null;
 	if (userRow) {
 		const beforeS = userRowToSnapshot(userRow);
-		const afterS = snapshotWithOverrides(beforeS, { budget_spent: afterSpentVal });
+		const afterS = snapshotWithOverrides(beforeS, {
+			budget_spent: afterSpentVal,
+			wallet_spent: roundGatewayMoney(Number(userRow.wallet_spent ?? 0) + split.fromWallet),
+		});
 		usageSnaps = {
 			before: snapshotToJson(beforeS),
 			after: snapshotToJson(afterS),
@@ -729,6 +754,7 @@ export async function recordImageUsage(params: RecordImageUsageParams): Promise<
 			meteredCost,
 			standardCost,
 			chargedCost,
+			chargedWalletCost: split.fromWallet,
 			routeGroup: params.routeGroup,
 			status: params.status,
 			latencyMs: params.latencyMs,
@@ -752,10 +778,12 @@ export async function recordImageUsage(params: RecordImageUsageParams): Promise<
 			providerKeyFingerprint: params.providerKeyFingerprint ?? null,
 			upstreamRequestId: params.upstreamRequestId ?? null,
 			upstreamMessageId: null,
+			ingressHost: params.ingressHost ?? null,
 		},
 		shouldChargeBudget,
 		beforeSpent,
 		chargedCost,
+		chargedFromWallet: split.fromWallet,
 		audit: {
 			apiKeyId: params.apiKeyId,
 			eventType: 'usage_charge',

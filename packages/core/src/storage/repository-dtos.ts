@@ -3,7 +3,7 @@
  * 数值列在 SQLite / PG 驱动下可能为 number 或 string，读侧统一为 `number | string` 的联合或经映射后的 number。
  */
 
-import type { ModelRouteRow } from '../types';
+import type { ApiKeyRateLimit, ModelRouteRow } from '../types';
 
 /** 管理端密钥列表行（`getAllApiKeys`，JOIN `users`）。 */
 export interface AdminApiKeyListItem {
@@ -18,8 +18,12 @@ export interface AdminApiKeyListItem {
 	budget_spent: number;
 	budget_period: string;
 	budget_reset_at: string | null;
+	wallet_granted: number;
+	wallet_spent: number;
 	status: string;
 	metadata: string | null;
+	last_used_at?: string | null;
+	rate_limit?: ApiKeyRateLimit | null;
 	created_at: string;
 	updated_at: string;
 }
@@ -139,6 +143,24 @@ export interface UserAnalyticsRow {
 	last_active_at: string | null;
 	budget_max: number | null;
 	budget_spent: number | null;
+	wallet_granted: number | null;
+	wallet_spent: number | null;
+	success_count: number;
+	error_count: number;
+}
+
+/** 分析：按用户下 API Key 聚合（`api_key_id` 为空表示已删除 Key 的历史日志）。 */
+export interface KeyAnalyticsRow {
+	api_key_id: string | null;
+	key_name: string | null;
+	request_count: number;
+	input_tokens: number;
+	output_tokens: number;
+	charged_cost: number;
+	metered_cost: number;
+	standard_cost: number;
+	distinct_models: number;
+	last_active_at: string | null;
 	success_count: number;
 	error_count: number;
 }

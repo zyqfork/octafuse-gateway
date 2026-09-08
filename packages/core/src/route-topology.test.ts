@@ -56,6 +56,14 @@ describe('route topology operations', () => {
 		assert.equal(normalizeRouteOperation(undefined), '*');
 		assert.equal(isRequestOperationForProtocol('openai', '*'), true);
 		assert.equal(effectiveUpstreamOperation('*', 'images.generations'), 'images.generations');
+		assert.equal(
+			effectiveUpstreamOperation('*', 'images.generations', 'dashscope-image-wan'),
+			'images.generations.multimodal',
+		);
+		assert.equal(
+			effectiveUpstreamOperation('*', 'chat', 'passthrough'),
+			'chat',
+		);
 		assert.equal(effectiveUpstreamOperation('chat', 'responses'), 'chat');
 	});
 
@@ -95,7 +103,11 @@ describe('route topology operations', () => {
 
 describe('route adapters', () => {
 	it('maps both explicit synchronous DashScope ASR families to the multimodal endpoint', () => {
-		for (const adapter of ['dashscope-asr-qwen-file', 'dashscope-asr-fun-file']) {
+		for (const adapter of [
+			'dashscope-asr-qwen-file',
+			'dashscope-asr-qwen-audio-file',
+			'dashscope-asr-fun-file',
+		]) {
 			assert.equal(
 				isRouteAdapterCompatible({
 					adapter,
@@ -156,6 +168,28 @@ describe('route adapters', () => {
 					requestOperation: 'audio.speech',
 					upstreamProtocol: 'dashscope',
 					upstreamOperation: 'audio.speech.multimodal',
+				}),
+				true
+			);
+		}
+		for (const adapter of ['dashscope-image-qwen', 'dashscope-image-wan']) {
+			assert.equal(
+				isRouteAdapterCompatible({
+					adapter,
+					requestProtocol: 'openai',
+					requestOperation: 'images.generations',
+					upstreamProtocol: 'dashscope',
+					upstreamOperation: 'images.generations.multimodal',
+				}),
+				true
+			);
+			assert.equal(
+				isRouteAdapterCompatible({
+					adapter,
+					requestProtocol: 'openai',
+					requestOperation: 'images.generations',
+					upstreamProtocol: 'dashscope',
+					upstreamOperation: '*',
 				}),
 				true
 			);

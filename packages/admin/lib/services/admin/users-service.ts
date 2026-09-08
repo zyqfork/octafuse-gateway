@@ -2,7 +2,8 @@
  * 管理端 `/admin/users`：列表、按外部对幂等创建、详情（懒重置预算）、计划/资料 PATCH、
  * 物理删除、子资源 keys / request-logs / audit-logs。
  */
-import type { BudgetPeriod, GatewayRepositories } from '@octafuse/core';
+import type { ApiKeyRateLimit, BudgetPeriod, GatewayRepositories } from '@octafuse/core';
+import { coerceRateLimitInput, rateLimitEquals, serializeApiKeyRateLimit } from '@octafuse/core';
 import type { UserListSortField, UserListSortOrder } from '@octafuse/core/db/users-list-sort';
 import { createKey, revokeKey, updateKeyName } from '@octafuse/core/services/key-service';
 import {
@@ -13,8 +14,10 @@ import {
 	replaceKeyMetadata,
 	updateKeyMetadata,
 	updateKeyStatus,
+	grantWalletCredit,
 	updateUserPlan,
 } from '@octafuse/core/services/user-service';
+import { isWalletCreditKind, WalletCreditUserNotFoundError } from '@octafuse/core';
 import {
 	applyBudgetTransition,
 	previewBudgetTransition,
@@ -214,6 +217,9 @@ export async function updateAdminUser(repos: GatewayRepositories, raw: string, i
 	const budget_base_in = input.budget_base;
 	const budget_period_in = input.budget_period;
 	const budget_spent_in = input.budget_spent;
+	const wallet_granted_in = input.wallet_granted;
+	const wallet_spent_in = input.wallet_spent;
+	const hasWalletField = wallet_granted_in !== undefined || wallet_spent_in !== undefined;
 	const hasBudgetField =
 		budget_max_in !== undefined ||
 		budget_base_in !== undefined ||
@@ -279,17 +285,23 @@ export async function updateAdminUser(repos: GatewayRepositories, raw: string, i
 		nextChargedCostFactorsJson = await resolveAdminChargedCostFactorsInput(repos, input.charged_cost_factors);
 	}
 
+	const rateLimitIn = coerceRateLimitInput(input.rate_limit);
+	if (!rateLimitIn.ok) throw badRequest(rateLimitIn.message);
+	const hasRateLimit = !('omit' in rateLimitIn);
+
 	if (
 		!hasBudgetField &&
+		!hasWalletField &&
 		!hasMetaObjectMerge &&
 		!hasMetaReplace &&
 		!hasStatus &&
 		!hasEmail &&
 		!hasExternalIdentity &&
-		!hasChargedCostFactors
+		!hasChargedCostFactors &&
+		!hasRateLimit
 	) {
 		throw badRequest(
-			'Provide at least one of email, budget_max, budget_base, budget_spent, budget_period, reset_budget, budget_reset_at, metadata, metadata_replace, status, external_system, external_user_id, charged_cost_factors'
+			'Provide at least one of email, budget_max, budget_base, budget_spent, budget_period, reset_budget, budget_reset_at, wallet_granted, wallet_spent, metadata, metadata_replace, status, external_system, external_user_id, charged_cost_factors, rate_limit'
 		);
 	}
 
@@ -319,13 +331,17 @@ export async function updateAdminUser(repos: GatewayRepositories, raw: string, i
 		const ok = await repos.users.setUserChargedCostFactorsById(userId, nextChargedCostFactorsJson);
 		if (!ok) throw new Error('Failed to update user');
 	}
+	if (!('omit' in rateLimitIn)) {
+		const ok = await repos.users.updateUserRateLimit(userId, serializeApiKeyRateLimit(rateLimitIn.value));
+		if (!ok) throw new Error('Failed to update user');
+	}
 
-	if (hasMetaObjectMerge && !hasBudgetField && !hasMetaReplace) {
+	if (hasMetaObjectMerge && !hasBudgetField && !hasWalletField && !hasMetaReplace) {
 		const existing: JsonObject = row.metadata ? (JSON.parse(row.metadata) as JsonObject) : {};
 		const merged = JSON.stringify({ ...existing, ...(input.metadata as JsonObject) });
 		const ok = await repos.users.setUserMetadataById(userId, merged);
 		if (!ok) throw new Error('Failed to update user');
-	} else if (hasBudgetField || hasMetaReplace) {
+	} else if (hasBudgetField || hasWalletField || hasMetaReplace) {
 		const effMax = budget_max_in === undefined ? row.budget_max : budget_max_in;
 		const effPeriod = (budget_period_in ?? row.budget_period) as BudgetPeriod;
 		let mergedMetadataJson: string | null | undefined;
@@ -366,6 +382,8 @@ export async function updateAdminUser(repos: GatewayRepositories, raw: string, i
 			metadata: mergedMetadataJson,
 			budget_spent: budget_spent_in,
 			budget_base: budget_base_in,
+			wallet_granted: wallet_granted_in,
+			wallet_spent: wallet_spent_in,
 		});
 		if (!ok) throw new Error('Failed to update user');
 	}
@@ -382,6 +400,9 @@ export async function updateAdminUser(repos: GatewayRepositories, raw: string, i
 		Number(rowAfter.budget_base ?? 0) !== Number(row.budget_base ?? 0) ||
 		(rowAfter.budget_period ?? null) !== (row.budget_period ?? null) ||
 		(rowAfter.budget_reset_at ?? null) !== (row.budget_reset_at ?? null);
+	const walletChanged =
+		Number(rowAfter.wallet_granted ?? 0) !== Number(row.wallet_granted ?? 0) ||
+		Number(rowAfter.wallet_spent ?? 0) !== Number(row.wallet_spent ?? 0);
 
 	const metadataChanged = (row.metadata ?? '') !== (rowAfter.metadata ?? '');
 	const statusChanged = (row.status ?? '') !== (rowAfter.status ?? '');
@@ -391,9 +412,10 @@ export async function updateAdminUser(repos: GatewayRepositories, raw: string, i
 	const externalChanged = externalSystemChanged || externalUserIdChanged;
 	const chargedCostFactorsChanged =
 		(row.charged_cost_factors ?? null) !== (rowAfter.charged_cost_factors ?? null);
+	const rateLimitChanged = !rateLimitEquals(row.rate_limit, rowAfter.rate_limit);
 
 	let profileAuditPayload: Record<string, unknown> | null = null;
-	if (metadataChanged || statusChanged || emailChanged || externalChanged || chargedCostFactorsChanged) {
+	if (metadataChanged || statusChanged || emailChanged || externalChanged || chargedCostFactorsChanged || rateLimitChanged) {
 		profileAuditPayload = {};
 		if (emailChanged) {
 			profileAuditPayload.email = { from: row.email ?? null, to: rowAfter.email ?? null };
@@ -430,6 +452,9 @@ export async function updateAdminUser(repos: GatewayRepositories, raw: string, i
 				to: parseUserChargedCostFactors(rowAfter.charged_cost_factors),
 			};
 		}
+		if (rateLimitChanged) {
+			profileAuditPayload.rate_limit = { from: row.rate_limit ?? null, to: rowAfter.rate_limit ?? null };
+		}
 	}
 
 	const profileAuditJson =
@@ -439,7 +464,7 @@ export async function updateAdminUser(repos: GatewayRepositories, raw: string, i
 	const afterUserSnap = snapshotToJson(userRowToSnapshot(rowAfter));
 	const userChangedFieldsJson = changedFieldsToJson(computeChangedFields(userRowToSnapshot(row), userRowToSnapshot(rowAfter)));
 
-	if (budgetChanged) {
+	if (budgetChanged || walletChanged) {
 		await repos.userAuditLogs.insertUserAuditLog(
 			userBudgetAuditToInsertRowFull(userId, {
 				id: crypto.randomUUID(),
@@ -447,7 +472,7 @@ export async function updateAdminUser(repos: GatewayRepositories, raw: string, i
 				eventType: 'admin_adjust',
 				actorType: 'admin',
 				actorId,
-				reasonCode: 'admin_patch_budget',
+				reasonCode: budgetChanged ? 'admin_patch_budget' : 'admin_patch_wallet',
 				reasonText: reasonText,
 				beforeSpent: Number(row.budget_spent ?? 0),
 				deltaSpent: Number(rowAfter.budget_spent ?? 0) - Number(row.budget_spent ?? 0),
@@ -468,18 +493,20 @@ export async function updateAdminUser(repos: GatewayRepositories, raw: string, i
 				correlationId: crypto.randomUUID(),
 			})
 		);
-	} else if (metadataChanged || statusChanged || emailChanged || externalChanged || chargedCostFactorsChanged) {
+	} else if (metadataChanged || statusChanged || emailChanged || externalChanged || chargedCostFactorsChanged || rateLimitChanged) {
 		let reasonCode = 'admin_patch_profile';
-		if (metadataChanged && !statusChanged && !emailChanged && !externalChanged && !chargedCostFactorsChanged) {
+		if (metadataChanged && !statusChanged && !emailChanged && !externalChanged && !chargedCostFactorsChanged && !rateLimitChanged) {
 			reasonCode = 'admin_patch_metadata';
-		} else if (statusChanged && !metadataChanged && !emailChanged && !externalChanged && !chargedCostFactorsChanged) {
+		} else if (statusChanged && !metadataChanged && !emailChanged && !externalChanged && !chargedCostFactorsChanged && !rateLimitChanged) {
 			reasonCode = 'admin_patch_status';
-		} else if (emailChanged && !metadataChanged && !statusChanged && !externalChanged && !chargedCostFactorsChanged) {
+		} else if (emailChanged && !metadataChanged && !statusChanged && !externalChanged && !chargedCostFactorsChanged && !rateLimitChanged) {
 			reasonCode = 'admin_patch_email';
-		} else if (externalChanged && !metadataChanged && !statusChanged && !emailChanged && !chargedCostFactorsChanged) {
+		} else if (externalChanged && !metadataChanged && !statusChanged && !emailChanged && !chargedCostFactorsChanged && !rateLimitChanged) {
 			reasonCode = 'admin_patch_external_identity';
-		} else if (chargedCostFactorsChanged && !metadataChanged && !statusChanged && !emailChanged && !externalChanged) {
+		} else if (chargedCostFactorsChanged && !metadataChanged && !statusChanged && !emailChanged && !externalChanged && !rateLimitChanged) {
 			reasonCode = 'admin_patch_charged_cost_factors';
+		} else if (rateLimitChanged && !metadataChanged && !statusChanged && !emailChanged && !externalChanged && !chargedCostFactorsChanged) {
+			reasonCode = 'admin_patch_rate_limit';
 		}
 		const spent = Number(rowAfter.budget_spent ?? 0);
 		const bmax = rowAfter.budget_max ?? null;
@@ -722,6 +749,7 @@ export type AdminUserKeyPatchInput = {
 	status?: string;
 	metadata?: unknown;
 	metadata_replace?: unknown;
+	rate_limit?: ApiKeyRateLimit | null;
 	reason?: string;
 };
 
@@ -766,6 +794,11 @@ export async function patchAdminUserKey(
 	if (input.name !== undefined) {
 		await updateKeyName(repos, keyId, input.name ?? null);
 	}
+	const rateLimitIn = coerceRateLimitInput(input.rate_limit);
+	if (!rateLimitIn.ok) throw badRequest(rateLimitIn.message);
+	if (!('omit' in rateLimitIn)) {
+		await repos.apiKeys.updateApiKeyRateLimit(keyId, serializeApiKeyRateLimit(rateLimitIn.value));
+	}
 	if (input.status !== undefined) {
 		const st = String(input.status);
 		if (st === 'revoked') await revokeKey(repos, keyId);
@@ -786,13 +819,17 @@ export async function patchAdminUserKey(
 	const metadataChanged = (row.metadata ?? '') !== (rowAfter.metadata ?? '');
 	const statusChanged = (row.status ?? '') !== (rowAfter.status ?? '');
 	const nameChanged = (row.name ?? null) !== (rowAfter.name ?? null);
+	const rateLimitChanged = !rateLimitEquals(row.rate_limit, rowAfter.rate_limit);
 
-	if (metadataChanged || statusChanged || nameChanged) {
+	if (metadataChanged || statusChanged || nameChanged || rateLimitChanged) {
 		const userAud = await repos.users.getById(userId);
 		const userSnapJson = userAud ? snapshotToJson(userRowToSnapshot(userAud)) : null;
 		let profileAuditPayload: Record<string, unknown> = {};
 		if (nameChanged) profileAuditPayload.name = { from: row.name ?? null, to: rowAfter.name ?? null };
 		if (statusChanged) profileAuditPayload.status = { from: row.status ?? null, to: rowAfter.status ?? null };
+		if (rateLimitChanged) {
+			profileAuditPayload.rate_limit = { from: row.rate_limit ?? null, to: rowAfter.rate_limit ?? null };
+		}
 		if (metadataChanged) {
 			let operation: 'merge' | 'replace' | 'update' = 'update';
 			let touchedKeys: string[] | undefined;
@@ -813,9 +850,10 @@ export async function patchAdminUserKey(
 		let reasonCode = 'admin_patch_key_profile';
 		if (isRevoked) {
 			reasonCode = 'admin_user_key_revoked';
-		} else if (metadataChanged && !statusChanged && !nameChanged) reasonCode = 'admin_patch_key_metadata';
-		else if (statusChanged && !metadataChanged && !nameChanged) reasonCode = 'admin_patch_key_status';
-		else if (nameChanged && !metadataChanged && !statusChanged) reasonCode = 'admin_patch_key_name';
+		} else if (metadataChanged && !statusChanged && !nameChanged && !rateLimitChanged) reasonCode = 'admin_patch_key_metadata';
+		else if (statusChanged && !metadataChanged && !nameChanged && !rateLimitChanged) reasonCode = 'admin_patch_key_status';
+		else if (nameChanged && !metadataChanged && !statusChanged && !rateLimitChanged) reasonCode = 'admin_patch_key_name';
+		else if (rateLimitChanged && !metadataChanged && !statusChanged && !nameChanged) reasonCode = 'admin_patch_key_rate_limit';
 		const eventType = isRevoked ? 'key_revoked' : 'admin_adjust';
 
 		await repos.userAuditLogs.insertUserAuditLog(
@@ -856,7 +894,7 @@ export async function patchAdminUserKey(
 export async function getAdminUserLogs(
 	repos: GatewayRepositories,
 	rawUser: string,
-	input: { page?: number; page_size?: number; status?: string }
+	input: { page?: number; page_size?: number; status?: string; api_key_id?: string }
 ) {
 	const userId = await resolveAdminUserId(repos, rawUser);
 	const page = Math.max(1, Number(input.page ?? 1));
@@ -865,12 +903,18 @@ export async function getAdminUserLogs(
 		input.status !== undefined && input.status !== null && String(input.status).trim() !== ''
 			? String(input.status).trim()
 			: undefined;
+	const apiKeyId = input.api_key_id?.trim() || undefined;
+	if (apiKeyId) {
+		const key = await repos.apiKeys.getApiKeyById(apiKeyId);
+		if (!key || key.user_id !== userId) throw notFound('Key not found');
+	}
 
 	const { logs, total } = await repos.requestLogs.getRequestLogs({
 		page,
 		pageSize: page_size,
 		userId,
 		status,
+		apiKeyId,
 	});
 	return { logs, total, page, page_size };
 }
@@ -878,10 +922,50 @@ export async function getAdminUserLogs(
 export async function getAdminUserAuditLogs(
 	repos: GatewayRepositories,
 	rawUser: string,
-	input: { page?: number; page_size?: number }
+	input: { page?: number; page_size?: number; event_type?: string }
 ) {
 	const userId = await resolveAdminUserId(repos, rawUser);
 	const page = Math.max(1, Number(input.page ?? 1));
 	const page_size = Math.min(100, Math.max(1, Number(input.page_size ?? 20)));
-	return repos.userAuditLogs.getUserAuditLogsByUserId(userId, page, page_size);
+	const eventType = input.event_type?.trim() || undefined;
+	return repos.userAuditLogs.getUserAuditLogsByUserId(userId, page, page_size, eventType);
+}
+
+export async function creditAdminUserWallet(
+	repos: GatewayRepositories,
+	rawUser: string,
+	input: { amount?: unknown; kind?: unknown; external_ref?: unknown; reason?: unknown },
+	actorId: string
+) {
+	const userId = await resolveAdminUserId(repos, rawUser);
+	const amount = Number(input.amount);
+	if (!Number.isFinite(amount) || amount === 0) {
+		throw badRequest('amount must be a non-zero number');
+	}
+	const kind = typeof input.kind === 'string' ? input.kind.trim() : '';
+	if (!isWalletCreditKind(kind)) {
+		throw badRequest('kind must be one of topup, signup_bonus, admin_adjust, refund');
+	}
+	const externalRef = typeof input.external_ref === 'string' ? input.external_ref.trim() : '';
+	if (!externalRef) {
+		throw badRequest('external_ref is required');
+	}
+	const reason = typeof input.reason === 'string' ? input.reason.trim() : undefined;
+	try {
+		return await grantWalletCredit(repos, {
+			userId,
+			amount,
+			kind,
+			externalRef,
+			reason,
+			actorType: 'admin',
+			actorId,
+			source: 'admin_wallet',
+		});
+	} catch (error) {
+		if (error instanceof WalletCreditUserNotFoundError) {
+			throw notFound('User not found');
+		}
+		throw error;
+	}
 }

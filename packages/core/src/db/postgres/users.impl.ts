@@ -3,6 +3,7 @@
  */
 import { and, asc, count, desc, eq, gt, isNotNull, isNull, like, lte, sql } from 'drizzle-orm';
 import type { UserRow } from '../../types';
+import { parseApiKeyRateLimit } from '../../lib/api-key-rate-limit';
 import { roundGatewayMoney } from '../../lib/money-precision';
 import type { PostgresDatabaseClient } from '../../storage/database-client';
 import type { UsersRepository } from '../../storage/gateway-repository-interfaces';
@@ -35,6 +36,12 @@ function userListOrderByClauses(sort: UserListSortField, order: UserListSortOrde
 	if (sort === 'budget_base') {
 		return [isAsc ? asc(pgUsersTable.budgetBase) : desc(pgUsersTable.budgetBase), tie];
 	}
+	if (sort === 'wallet_granted') {
+		return [isAsc ? asc(pgUsersTable.walletGranted) : desc(pgUsersTable.walletGranted), tie];
+	}
+	if (sort === 'wallet_spent') {
+		return [isAsc ? asc(pgUsersTable.walletSpent) : desc(pgUsersTable.walletSpent), tie];
+	}
 	return [isAsc ? asc(pgUsersTable.createdAt) : desc(pgUsersTable.createdAt)];
 }
 
@@ -46,8 +53,11 @@ function mapPgUserRow(r: {
 	budgetSpent: string;
 	budgetPeriod: string;
 	budgetResetAt: string | null;
+	walletGranted: string;
+	walletSpent: string;
 	status: string;
 	metadata: string | null;
+	rateLimit: string | null;
 	chargedCostFactors: string | null;
 	externalSystem: string | null;
 	externalUserId: string | null;
@@ -62,8 +72,11 @@ function mapPgUserRow(r: {
 		budget_spent: parseMoney(r.budgetSpent),
 		budget_period: r.budgetPeriod,
 		budget_reset_at: r.budgetResetAt,
+		wallet_granted: parseMoney(r.walletGranted),
+		wallet_spent: parseMoney(r.walletSpent),
 		status: r.status,
 		metadata: r.metadata,
+		rate_limit: parseApiKeyRateLimit(r.rateLimit),
 		charged_cost_factors: r.chargedCostFactors ?? null,
 		external_system: r.externalSystem,
 		external_user_id: r.externalUserId,
@@ -167,7 +180,9 @@ export function createPostgresUsersRepository(db: PostgresDatabaseClient): Users
 			resetBudget: boolean = true,
 			metadata?: string | null,
 			budget_spent_override?: number | null,
-			budget_base?: number | null
+			budget_base?: number | null,
+			wallet_granted?: number | null,
+			wallet_spent?: number | null
 		): Promise<boolean> {
 			const now = new Date().toISOString();
 			const baseSet: Record<string, unknown> = {
@@ -178,6 +193,12 @@ export function createPostgresUsersRepository(db: PostgresDatabaseClient): Users
 			};
 			if (budget_base !== undefined) {
 				baseSet.budgetBase = String(budget_base != null ? roundGatewayMoney(budget_base) : 0);
+			}
+			if (wallet_granted !== undefined) {
+				baseSet.walletGranted = String(roundGatewayMoney(wallet_granted ?? 0));
+			}
+			if (wallet_spent !== undefined) {
+				baseSet.walletSpent = String(roundGatewayMoney(wallet_spent ?? 0));
 			}
 			if (budget_spent_override !== undefined) {
 				const updated = await drizzle
@@ -219,6 +240,16 @@ export function createPostgresUsersRepository(db: PostgresDatabaseClient): Users
 			const updated = await drizzle
 				.update(pgUsersTable)
 				.set({ status, updatedAt: now })
+				.where(eq(pgUsersTable.id, id))
+				.returning({ id: pgUsersTable.id });
+			return updated.length > 0;
+		},
+
+		async updateUserRateLimit(id: string, rateLimitJson: string | null): Promise<boolean> {
+			const now = new Date().toISOString();
+			const updated = await drizzle
+				.update(pgUsersTable)
+				.set({ rateLimit: rateLimitJson, updatedAt: now })
 				.where(eq(pgUsersTable.id, id))
 				.returning({ id: pgUsersTable.id });
 			return updated.length > 0;

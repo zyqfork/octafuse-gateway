@@ -2,7 +2,7 @@
  * v1 代理路由共用的 user+model 熔断：请求前短路 + 上游触发写入 + 成功清零 + 短路请求记账。
  */
 import type { Context } from 'hono';
-import type { GatewayRepositories } from '@octafuse/core';
+import type { GatewayRepositories, UpstreamProtocol } from '@octafuse/core';
 import type { ApiKeyContext } from '../middleware/auth';
 import { scheduleBackgroundWork } from '../runtime/schedule-background-work';
 import { EMPTY_USAGE } from './proxy';
@@ -15,6 +15,7 @@ import {
 	recordUserModelCircuitTrigger,
 } from './user-model-circuit-breaker';
 import type { GatewayCircuitAlertEvent } from './circuit-alert-types';
+import { allocateRequestLogId } from './accounting';
 import { recordUsage } from './usage-tracker';
 import type { RequestTimingCollector } from './request-timing';
 
@@ -24,7 +25,7 @@ export type UserModelCircuitRouteContext = {
 	baseModelId: string;
 	modelNameForLog: string;
 	requestBodyForLog: string | null;
-	requestProtocol: 'openai' | 'anthropic' | 'gemini';
+	requestProtocol: UpstreamProtocol;
 	startMs: number;
 	timing?: RequestTimingCollector | null;
 	/**
@@ -65,9 +66,11 @@ export function maybeBlockUserModelCircuit(
 	scheduleBackgroundWork(
 		c,
 		recordUsage(repos, {
+			requestLogId: allocateRequestLogId(),
 			api_key_id: apiKey.keyId,
 			user_id: apiKey.userId,
 			user_email: apiKey.userEmail,
+			ingress_host: apiKey.ingressHost ?? null,
 			model_id: ctx.baseModelId,
 			provider_id: GATEWAY_PROVIDER_ID,
 			model_name: ctx.modelNameForLog,

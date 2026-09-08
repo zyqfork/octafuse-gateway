@@ -1,4 +1,4 @@
-import { applyVertexOpenAiModelPrefix, resolveProviderUpstreamSecret, resolveUpstreamEndpoint } from '@octafuse/core';
+import { applyVertexOpenAiModelPrefix, applyRouteExtraHeaders, resolveProviderUpstreamSecret, resolveUpstreamEndpoint } from '@octafuse/core';
 import type { RouteResult } from '../model-router';
 import type { UsageFromStream } from '../proxy';
 import { buildRouteRequestBody } from '../route-default-params';
@@ -65,7 +65,7 @@ const encoder = new TextEncoder();
  * 网关内部计费公式假设：`input_tokens = regular + cache_read + cache_write`。
  * 因此这里需要把上游口径归一到该语义。
  */
-function normalizeInputTokensFromPrompt(args: {
+export function normalizeInputTokensFromPrompt(args: {
   promptTokens: number;
   completionTokens: number;
   cacheRead: number;
@@ -96,7 +96,7 @@ function normalizeInputTokensFromPrompt(args: {
   return promptTokens;
 }
 
-function usageFromProvider(u: ProviderUsage): UsageFromStream {
+export function usageFromProvider(u: ProviderUsage): UsageFromStream {
   const promptTokensRaw = u.prompt_tokens ?? u.input_tokens ?? 0;
   const completionTokens = u.completion_tokens ?? u.output_tokens ?? 0;
   const cacheRead = u.prompt_tokens_details?.cached_tokens ?? 0;
@@ -202,7 +202,7 @@ function processUsageFromDataLine(line: string, usage: UsageFromStream, timing?:
  *
  * 非 `data:` 行、解析失败、`[DONE]` 原样返回。
  */
-function transformStreamUsageForClient(line: string): string {
+export function transformStreamUsageForClient(line: string): string {
   if (!line.startsWith('data: ')) return line;
   const data = line.slice(6).trim();
   if (data === '[DONE]') return line;
@@ -433,10 +433,13 @@ export async function dispatchOpenAiRoute(
 
   const response = await fetch(url, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${secret}`,
-    },
+    headers: applyRouteExtraHeaders(
+      {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${secret}`,
+      },
+      route.customParams
+    ),
     body: JSON.stringify(requestBody),
   });
   timing?.markAttemptHeaders(attempt, response.status);

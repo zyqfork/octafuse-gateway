@@ -1,8 +1,8 @@
 /**
  * 用户密钥鉴权：校验 Bearer sk-，并在读库时触发与 `user-service.maybeResetBudget` 一致的预算周期重置写回。
  */
-import type { GatewayRepositories } from '@octafuse/core';
 import { persistLazyBudgetResetIfNeeded, resolveMeMetadata, roundGatewayMoney } from '@octafuse/core';
+import type { ApiKeyRateLimit, GatewayRepositories } from '@octafuse/core';
 
 /** 鉴权成功后注入上下文（与中间件 `ApiKeyContext` 字段对应）。 */
 export type AuthenticatedApiKey = {
@@ -14,11 +14,19 @@ export type AuthenticatedApiKey = {
 	budgetMax: number | null;
 	/** 当前周期已计入的消耗（可能已懒重置） */
 	budgetSpent: number;
+	/** 累计发放的永久额度 */
+	walletGranted: number;
+	/** 累计消耗的永久额度 */
+	walletSpent: number;
 	budgetPeriod: string;
 	budgetResetAt: string | null;
 	metadata: Record<string, unknown> | null;
 	/** `users.charged_cost_factors` JSON；无折扣时为 null */
 	chargedCostFactors: string | null;
+	/** `api_keys.rate_limit`；null = unlimited */
+	rateLimit: ApiKeyRateLimit | null;
+	/** `users.rate_limit`；null = user layer unlimited */
+	userRateLimit: ApiKeyRateLimit | null;
 };
 
 /**
@@ -59,9 +67,13 @@ export async function authenticateApiKey(repos: GatewayRepositories, key: string
 		userEmail: row.user_email,
 		budgetMax,
 		budgetSpent: roundGatewayMoney(budgetSpent),
+		walletGranted: roundGatewayMoney(Number(row.wallet_granted ?? 0)),
+		walletSpent: roundGatewayMoney(Number(row.wallet_spent ?? 0)),
 		budgetPeriod: row.budget_period,
 		budgetResetAt,
 		metadata,
 		chargedCostFactors: row.user_charged_cost_factors ?? null,
+		rateLimit: row.rate_limit ?? null,
+		userRateLimit: row.user_rate_limit ?? null,
 	};
 }

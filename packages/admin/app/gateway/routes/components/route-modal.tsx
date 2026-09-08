@@ -13,23 +13,38 @@ import {
 	TrashIcon,
 } from '@heroicons/react/24/outline';
 import { useTranslations } from 'next-intl';
-import { isAudioSpeechModel } from '@octafuse/core/db/model-modalities';
 import { ReadOnlyImagePricing } from '@/components/read-only-image-pricing';
 import { ReadOnlyPricingTiersTable } from '@/components/read-only-pricing-tiers-table';
 import { type CatalogAudioPricingDisplay } from '@/lib/audio-transcriptions';
-import type { CatalogImagePricingDisplay, CatalogPricingTierDisplayRow } from '@/lib/pricing-ui';
+import {
+	getUserChargedCatalogTierRows,
+	type CatalogImagePricingDisplay,
+	type CatalogPricingTierDisplayRow,
+} from '@/lib/pricing-ui';
 import type { GatewayModel, GatewayProvider } from '@/lib/types';
 import { UPSTREAM_PROTOCOLS, type UpstreamProtocol } from '@/lib/upstream-protocol';
 import {
-	applyDashScopeTtsRoutePreset,
+	adapterOptionMappingSuffix,
+	alignRouteScheduleWindowsToCatalog,
+	applyAdapterOptionToForm,
+	catalogScheduleWindowsFromModel,
 	compatibleAdaptersForRoute,
+	customHeaderRowsHaveValues,
 	formatRoutePriceOverridePreview,
+	listAdapterOptionsForModel,
 	requestOperationsForModel,
+	resolveAdapterOptionKey,
 	upstreamOperationsForProviderModel,
 } from '../route-utils';
 import type { RouteFormData, RouteListRow } from '../types';
-import { DailyScheduleEditor } from './daily-schedule-editor';
+import { DailyScheduleEditor } from '@/components/daily-schedule-editor';
+import {
+	formatIsoWeekdaysHint,
+	resolveDailyScheduleFactor,
+	scheduleWindowKey,
+} from '@octafuse/core/db/pricing-schedule';
 import { RoutePricePanel } from './route-price-panel';
+import { ScheduleWindowEffectivePrices } from './schedule-window-effective-prices';
 
 type Props = {
 	open: boolean;
@@ -91,7 +106,13 @@ export function RouteModal(props: Props) {
 	const tCommon = useTranslations('common');
 	const adapterLabel = (adapter: string) =>
 		t.has(`adapterNames.${adapter}`) ? t(`adapterNames.${adapter}`) : adapter;
-	const hasCustomParams = formData.custom_params_json.trim().length > 0;
+	const hasCustomHeaders = customHeaderRowsHaveValues(formData.custom_headers);
+	const hasCustomBody = formData.custom_params_json.trim().length > 0;
+	const hasCustomParams =
+		hasCustomHeaders ||
+		hasCustomBody ||
+		formData.custom_params_force_override_headers ||
+		formData.custom_params_force_override_body;
 	const customParamsSessionKey = `${open ? '1' : '0'}:${editingRoute?.id ?? ''}:${duplicateSourceRouteId ?? ''}`;
 	const [customParamsSession, setCustomParamsSession] = useState(customParamsSessionKey);
 	const [customParamsOpen, setCustomParamsOpen] = useState(() => open && hasCustomParams);
@@ -104,7 +125,23 @@ export function RouteModal(props: Props) {
 		setPriceOverrideJsonCopied(false);
 	}
 	const priceOverridePreview = useMemo(() => formatRoutePriceOverridePreview(formData), [formData]);
+	const catalogScheduleWindows = useMemo(
+		() => catalogScheduleWindowsFromModel(selectedModel),
+		[selectedModel]
+	);
+	const catalogScheduleLocked = catalogScheduleWindows.length > 0;
+	const editorScheduleWindows = catalogScheduleLocked
+		? alignRouteScheduleWindowsToCatalog(catalogScheduleWindows, formData.schedule_windows)
+		: formData.schedule_windows;
+	const catalogNowSchedule = useMemo(
+		() => resolveDailyScheduleFactor(catalogScheduleWindows, new Date(), businessTimezone),
+		[catalogScheduleWindows, businessTimezone]
+	);
+	const catalogNowWindowKey = catalogNowSchedule.window
+		? scheduleWindowKey(catalogNowSchedule.window)
+		: null;
 
+	// Image models keep the public request protocol as OpenAI; upstream may be openai or dashscope.
 	const lockOpenaiProtocol = selectedModelIsImage;
 	const requestProtocols = UPSTREAM_PROTOCOLS.filter(
 		(protocol) => requestOperationsForModel(selectedModel, protocol, formData.provider_model_name).length > 0,
@@ -120,9 +157,25 @@ export function RouteModal(props: Props) {
 		formData.upstream_protocol,
 		formData.provider_model_name,
 	);
+	const adapterOptions = listAdapterOptionsForModel(
+		selectedModel,
+		selectedProvider,
+		formData.provider_model_name,
+	);
+	const selectedAdapterOptionKey = resolveAdapterOptionKey(formData);
+	const selectedAdapterOption = adapterOptions.find((option) => option.descriptor.optionKey === selectedAdapterOptionKey);
+	const visibleAdapterOptions = selectedProvider
+		? adapterOptions.filter(
+				(option) => option.available || option.descriptor.optionKey === selectedAdapterOptionKey,
+			)
+		: [];
 	const compatibleAdapters = compatibleAdaptersForRoute(formData);
 	const showCurrentAdapter =
-		Boolean(editingRoute) && !compatibleAdapters.includes(formData.adapter) && Boolean(formData.adapter);
+		Boolean(editingRoute) &&
+		!selectedAdapterOption &&
+		!compatibleAdapters.includes(formData.adapter) &&
+		Boolean(formData.adapter);
+	const lockTopology = Boolean(selectedAdapterOption) && !showCurrentAdapter;
 	const selectableProviders = providers.filter(
 		(provider) =>
 			(Boolean(editingRoute || duplicateSourceRouteId) && provider.id === formData.provider_id) ||
@@ -140,22 +193,6 @@ export function RouteModal(props: Props) {
 		Boolean(editingRoute) &&
 		!upstreamOperations.includes(formData.upstream_operation) &&
 		Boolean(formData.upstream_operation);
-	const selectedModelIsSpeech = selectedModel ? isAudioSpeechModel(selectedModel) : false;
-	const dashScopeTtsOperations = selectedModelIsSpeech
-		? upstreamOperationsForProviderModel(
-				selectedProvider,
-				selectedModel,
-				'dashscope',
-				formData.provider_model_name,
-		  )
-		: [];
-	const canUseDashScopeTtsPresets =
-		!selectedModelIsImage &&
-		selectedModelIsSpeech &&
-		selectedProvider != null &&
-		(dashScopeTtsOperations.includes('audio.speech') ||
-			dashScopeTtsOperations.includes('audio.speech.realtime.inference'));
-
 	if (!open) return null;
 
 	return (
@@ -203,36 +240,6 @@ export function RouteModal(props: Props) {
 					)}
 
 					<div className="space-y-4">
-						{canUseDashScopeTtsPresets ? (
-							<section className="rounded-lg border border-blue-200 bg-blue-50/60 p-3.5">
-								<div className="mb-2">
-									<h3 className="text-xs font-semibold uppercase tracking-wide text-blue-900">
-										{t('audioPresetTitle')}
-									</h3>
-									<p className="mt-1 text-xs text-blue-800">{t('audioPresetHint')}</p>
-								</div>
-								<div className="flex flex-wrap gap-2">
-									{dashScopeTtsOperations.includes('audio.speech') ? (
-										<button
-											type="button"
-											className="rounded-md border border-blue-300 bg-white px-3 py-2 text-sm font-medium text-blue-800 transition hover:bg-blue-100 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
-											onClick={() => onFormChange(applyDashScopeTtsRoutePreset(formData, 'nonrealtime'))}
-										>
-											{t('audioPresetNonRealtime')}
-										</button>
-									) : null}
-									{dashScopeTtsOperations.includes('audio.speech.realtime.inference') ? (
-										<button
-											type="button"
-											className="rounded-md border border-blue-300 bg-white px-3 py-2 text-sm font-medium text-blue-800 transition hover:bg-blue-100 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
-											onClick={() => onFormChange(applyDashScopeTtsRoutePreset(formData, 'realtime'))}
-										>
-											{t('audioPresetRealtime')}
-										</button>
-									) : null}
-								</div>
-							</section>
-						) : null}
 						<section>
 							<h3 className="mb-2.5 text-xs font-semibold uppercase tracking-wide text-gray-500">
 								{t('basicMapping')}
@@ -295,6 +302,10 @@ export function RouteModal(props: Props) {
 														request_operation: requestOperation,
 														upstream_protocol: upstreamProtocol,
 														upstream_operation: upstreamOperation,
+														schedule_windows: alignRouteScheduleWindowsToCatalog(
+															catalogScheduleWindowsFromModel(nextModel),
+															[]
+														),
 													});
 												}}
 												className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
@@ -335,7 +346,7 @@ export function RouteModal(props: Props) {
 														request_operation: requestOperation,
 													});
 												}}
-												disabled={lockOpenaiProtocol}
+												disabled={lockOpenaiProtocol || lockTopology}
 												className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/30 disabled:cursor-not-allowed disabled:bg-gray-100"
 											>
 												{requestProtocols.map((p) => (
@@ -355,7 +366,8 @@ export function RouteModal(props: Props) {
 														request_operation: e.target.value,
 													})
 												}
-												className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 font-mono text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+												disabled={lockTopology}
+												className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 font-mono text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/30 disabled:cursor-not-allowed disabled:bg-gray-100"
 											>
 												{requestOperations.map((operation) => (
 													<option key={operation} value={operation}>
@@ -439,18 +451,27 @@ export function RouteModal(props: Props) {
 									<div>
 										<label className="mb-1 block text-sm font-medium text-gray-700">{t('adapter')}</label>
 										<select
-											value={formData.adapter}
-											onChange={(e) => onFormChange({ ...formData, adapter: e.target.value })}
-											disabled={compatibleAdapters.length <= 1}
+											value={selectedAdapterOptionKey ?? formData.adapter}
+											onChange={(e) => onFormChange(applyAdapterOptionToForm(formData, e.target.value))}
 											title={formData.adapter}
-											className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/30 disabled:cursor-not-allowed disabled:bg-gray-100 disabled:text-gray-600"
+											disabled={!selectedProvider}
+											className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/30 disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-500"
 										>
-											{compatibleAdapters.length === 0 ? (
+											{!selectedProvider ? (
+												<option value={formData.adapter}>{t('protocolHintSelectProvider')}</option>
+											) : visibleAdapterOptions.length === 0 ? (
 												<option value={formData.adapter}>{t('noCompatibleAdapter')}</option>
 											) : null}
-											{compatibleAdapters.map((adapter) => (
-												<option key={adapter} value={adapter} title={adapter}>
-													{adapterLabel(adapter)}
+											{visibleAdapterOptions.map((option) => (
+												<option
+													key={option.descriptor.optionKey}
+													value={option.descriptor.optionKey}
+													title={option.descriptor.id}
+													disabled={!option.available && option.descriptor.optionKey !== selectedAdapterOptionKey}
+												>
+													{adapterLabel(option.descriptor.id)}
+													{adapterOptionMappingSuffix(option.descriptor)}
+													{!option.available ? ` · ${t('adapterUnavailable')}` : ''}
 												</option>
 											))}
 											{showCurrentAdapter ? (
@@ -459,7 +480,23 @@ export function RouteModal(props: Props) {
 												</option>
 											) : null}
 										</select>
-										<p className="mt-1 text-[11px] text-gray-500">{t('adapterHint')}</p>
+										<p className="mt-1 text-[11px] text-gray-500">
+											{selectedProvider ? t('adapterFirstHint') : t('protocolHintSelectProvider')}
+										</p>
+										{selectedAdapterOption && selectedAdapterOption.missingCapabilities.length > 0 ? (
+											<p className="mt-1 text-[11px] text-amber-700">
+												{t('adapterMissingCapabilities', {
+													capabilities: selectedAdapterOption.missingCapabilities.join(', '),
+												})}
+											</p>
+										) : null}
+										{selectedAdapterOption?.descriptor.lossyFeatures?.length ? (
+											<p className="mt-1 text-[11px] text-amber-700">
+												{t('adapterLossyFeatures', {
+													features: selectedAdapterOption.descriptor.lossyFeatures.join(', '),
+												})}
+											</p>
+										) : null}
 									</div>
 									<div className={customParamsOpen ? 'flex min-h-0 flex-1 flex-col' : undefined}>
 										<button
@@ -476,13 +513,22 @@ export function RouteModal(props: Props) {
 										>
 											<span>{t('customParams')}</span>
 											<span className="flex shrink-0 items-center gap-1.5">
-												{hasCustomParams ? (
+												{hasCustomHeaders ? (
 													<span
 														className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
 															customParamsOpen ? 'bg-amber-100 text-amber-800' : 'bg-gray-100 text-gray-600'
 														}`}
 													>
-														JSON
+														{t('customHeadersBadge')}
+													</span>
+												) : null}
+												{hasCustomBody ? (
+													<span
+														className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
+															customParamsOpen ? 'bg-amber-100 text-amber-800' : 'bg-gray-100 text-gray-600'
+														}`}
+													>
+														{t('customBodyBadge')}
 													</span>
 												) : null}
 												<ChevronDownIcon
@@ -611,7 +657,7 @@ export function RouteModal(props: Props) {
 															formData.upstream_operation,
 													});
 												}}
-												disabled={!selectedProvider}
+												disabled={!selectedProvider || lockTopology}
 												title={selectedProvider ? t('protocolHintConfigured') : t('protocolHintSelectProvider')}
 												className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/30 disabled:cursor-not-allowed disabled:bg-gray-100 disabled:text-gray-600"
 											>
@@ -632,7 +678,7 @@ export function RouteModal(props: Props) {
 														upstream_operation: e.target.value,
 													})
 												}
-												disabled={!selectedProvider || upstreamOperations.length === 0}
+												disabled={!selectedProvider || upstreamOperations.length === 0 || lockTopology}
 												className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 font-mono text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/30 disabled:cursor-not-allowed disabled:bg-gray-100 disabled:text-gray-600"
 											>
 												{upstreamOperations.map((operation) => (
@@ -669,23 +715,149 @@ export function RouteModal(props: Props) {
 										id="route-custom-params"
 										className="rounded-lg border border-amber-300 bg-amber-50/70 p-3"
 									>
-										<div className="mb-2 flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
-											<h4 className="text-sm font-medium text-amber-900">{t('customParams')}</h4>
-											<p className="text-[11px] text-amber-800/80">{t('requestDefaultsHint')}</p>
+										<div className="grid grid-cols-1 gap-3 lg:grid-cols-2 lg:items-stretch">
+											<div className="flex min-h-0 min-w-0 flex-col rounded-md border border-amber-200/80 bg-white/70 p-2.5">
+												<div className="mb-2 flex items-start justify-between gap-2">
+													<div className="min-w-0">
+														<h4 className="text-sm font-medium text-amber-900">{t('customHeaders')}</h4>
+														<p className="mt-0.5 text-[11px] leading-4 text-amber-800/80">
+															{formData.custom_params_force_override_headers
+																? t('customHeadersHintForceOverride')
+																: t('customHeadersHint')}
+														</p>
+													</div>
+													<label className="inline-flex shrink-0 items-center gap-1.5 text-[11px] font-medium text-amber-900">
+														<input
+															type="checkbox"
+															checked={formData.custom_params_force_override_headers}
+															onChange={(e) =>
+																onFormChange({
+																	...formData,
+																	custom_params_force_override_headers: e.target.checked,
+																})
+															}
+															className="h-3.5 w-3.5 rounded border-amber-300 text-amber-700 focus:ring-amber-500"
+														/>
+														{t('customBodyForceOverride')}
+													</label>
+												</div>
+												<div className="flex min-h-0 flex-1 flex-col">
+													{formData.custom_headers.length > 0 ? (
+														<div className="mb-1.5 space-y-1.5">
+															{formData.custom_headers.map((row, index) => (
+																<div
+																	key={index}
+																	className="grid grid-cols-[minmax(7rem,10rem)_auto_minmax(0,1fr)_auto] items-center gap-1.5"
+																>
+																	<input
+																		type="text"
+																		value={row.name}
+																		onChange={(e) =>
+																			onFormChange({
+																				...formData,
+																				custom_headers: formData.custom_headers.map((item, i) =>
+																					i === index ? { ...item, name: e.target.value } : item
+																				),
+																			})
+																		}
+																		className="min-w-0 rounded-md border border-amber-200 bg-white px-2 py-1.5 font-mono text-xs text-gray-900 placeholder:text-gray-400 focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-500/30"
+																		placeholder={t('customHeadersNamePlaceholder')}
+																		aria-label={t('customHeadersName')}
+																		autoComplete="off"
+																		spellCheck={false}
+																	/>
+																	<span className="select-none font-mono text-xs text-amber-700/70" aria-hidden>
+																		:
+																	</span>
+																	<input
+																		type="text"
+																		value={row.value}
+																		onChange={(e) =>
+																			onFormChange({
+																				...formData,
+																				custom_headers: formData.custom_headers.map((item, i) =>
+																					i === index ? { ...item, value: e.target.value } : item
+																				),
+																			})
+																		}
+																		className="min-w-0 rounded-md border border-amber-200 bg-white px-2 py-1.5 font-mono text-xs text-gray-900 placeholder:text-gray-400 focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-500/30"
+																		placeholder={t('customHeadersValuePlaceholder')}
+																		aria-label={t('customHeadersValue')}
+																		autoComplete="off"
+																		spellCheck={false}
+																	/>
+																	<button
+																		type="button"
+																		onClick={() => {
+																			onFormChange({
+																				...formData,
+																				custom_headers: formData.custom_headers.filter((_, i) => i !== index),
+																			});
+																		}}
+																		className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-gray-400 transition hover:bg-red-50 hover:text-red-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500/40"
+																		aria-label={t('customHeadersRemove')}
+																		title={t('customHeadersRemove')}
+																	>
+																		<TrashIcon className="h-4 w-4" aria-hidden />
+																	</button>
+																</div>
+															))}
+														</div>
+													) : null}
+													<button
+														type="button"
+														onClick={() =>
+															onFormChange({
+																...formData,
+																custom_headers: [...formData.custom_headers, { name: '', value: '' }],
+															})
+														}
+														className="inline-flex w-full items-center justify-center gap-1.5 rounded-md border border-dashed border-amber-400 bg-white px-3 py-1.5 text-[11px] font-medium text-amber-700 shadow-sm transition hover:border-amber-500 hover:bg-amber-50 hover:text-amber-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40"
+													>
+														<PlusIcon className="h-3.5 w-3.5" aria-hidden />
+														{t('customHeadersAdd')}
+													</button>
+												</div>
+											</div>
+											<div className="flex min-h-0 min-w-0 flex-col rounded-md border border-amber-200/80 bg-white/70 p-2.5">
+												<div className="flex items-start justify-between gap-2">
+													<h4 className="text-sm font-medium text-amber-900">{t('customBody')}</h4>
+													<label className="inline-flex shrink-0 items-center gap-1.5 text-[11px] font-medium text-amber-900">
+														<input
+															type="checkbox"
+															checked={formData.custom_params_force_override_body}
+															onChange={(e) =>
+																onFormChange({
+																	...formData,
+																	custom_params_force_override_body: e.target.checked,
+																})
+															}
+															className="h-3.5 w-3.5 rounded border-amber-300 text-amber-700 focus:ring-amber-500"
+														/>
+														{t('customBodyForceOverride')}
+													</label>
+												</div>
+												<p className="mt-0.5 mb-2 text-[11px] leading-4 text-amber-800/80">
+													{formData.custom_params_force_override_body
+														? t('customBodyHintForceOverride')
+														: t('customBodyHint')}
+												</p>
+												<textarea
+													rows={5}
+													value={formData.custom_params_json}
+													onChange={(e) =>
+														onFormChange({
+															...formData,
+															custom_params_json: e.target.value,
+														})
+													}
+													className="min-h-[120px] flex-1 resize-y rounded-md border border-amber-200 bg-white px-3 py-2 font-mono text-xs leading-relaxed focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-500/30"
+													placeholder={t('customParamsPlaceholder')}
+													spellCheck={false}
+													aria-label={t('customBody')}
+												/>
+											</div>
 										</div>
-										<textarea
-											rows={5}
-											value={formData.custom_params_json}
-											onChange={(e) =>
-												onFormChange({
-													...formData,
-													custom_params_json: e.target.value,
-												})
-											}
-											className="min-h-[120px] w-full resize-y rounded-md border border-amber-200 bg-white px-3 py-2 font-mono text-xs leading-relaxed focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-500/30"
-											placeholder={t('customParamsPlaceholder')}
-											spellCheck={false}
-										/>
 									</div>
 								</div>
 							) : null}
@@ -704,6 +876,7 @@ export function RouteModal(props: Props) {
 												? t('standardCatalogHintImage')
 												: t('standardCatalogHint')}
 									</p>
+									<RoutePricePanel variant="neutral" fillHeight>
 									<div className="flex min-h-0 flex-1 flex-col">
 								{selectedModelIsAudio ? (
 									catalogAudioPricingDisplay ? (
@@ -778,14 +951,87 @@ export function RouteModal(props: Props) {
 									/>
 								) : (
 									<ReadOnlyPricingTiersTable
-										fillHeight
+										fillHeight={!catalogScheduleLocked}
 										rows={catalogStandardTierRows}
 										emptyLabel={formData.model_id ? t('noCatalogPricing') : t('selectModelForTiers')}
 										tableTitle={t('readOnlyCatalogRates')}
 										billingCurrencyCode={billingCurrency}
 									/>
 								)}
+								{catalogScheduleLocked ? (
+									<div className="mt-3 border-t border-gray-200/90 pt-3">
+										<div className="mb-1.5 min-w-0">
+											<h4 className="text-[11px] font-semibold uppercase tracking-wide text-gray-700">
+												{t('catalogOfficialSchedule')}
+											</h4>
+											<p className="mt-0.5 text-[11px] text-gray-500">
+												{t('catalogScheduleLockedHint')}
+											</p>
+										</div>
+										<ul className="space-y-2.5">
+											{catalogScheduleWindows.map((w, i) => {
+												const daysHint = formatIsoWeekdaysHint(w.days);
+												const daysLabel =
+													daysHint === 'Mon–Fri'
+														? t('scheduleWeekdays')
+														: daysHint === 'Sat–Sun'
+															? t('scheduleWeekend')
+															: daysHint ?? t('scheduleEveryday');
+												const active = catalogNowWindowKey === scheduleWindowKey(w);
+												const officialRows =
+													selectedModel &&
+													!selectedModelIsImage &&
+													!selectedModelIsAudio &&
+													catalogStandardTierRows.length > 0
+														? getUserChargedCatalogTierRows(selectedModel, w.factor, billingCurrency)
+														: [];
+												return (
+													<li
+														key={`${w.start}-${w.end}-${i}`}
+														className={
+															active
+																? 'space-y-1.5 rounded-md border border-amber-300 bg-amber-50/80 p-2 ring-1 ring-amber-200/80'
+																: 'space-y-1.5 rounded-md border border-gray-200 bg-white p-2'
+														}
+													>
+														<div className="flex items-center justify-between gap-3 text-[11px]">
+															<div className="min-w-0">
+																<p className={`font-mono tabular-nums ${active ? 'text-amber-950' : 'text-gray-800'}`}>
+																	{w.start}–{w.end}
+																	<span className={`ml-1.5 font-sans text-[10px] ${active ? 'text-amber-800/80' : 'text-gray-500'}`}>
+																		{daysLabel}
+																	</span>
+																</p>
+															</div>
+															<div className="flex shrink-0 items-center gap-2">
+																{active ? (
+																	<span className="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800">
+																		{t('catalogScheduleNow')}
+																	</span>
+																) : null}
+																<span className={`font-mono text-xs tabular-nums ${active ? 'text-amber-950' : 'text-gray-800'}`}>
+																	×{w.factor}
+																</span>
+															</div>
+														</div>
+														{officialRows.length > 0 ? (
+															<ReadOnlyPricingTiersTable
+																dense
+																hideUnitFooter
+																rows={officialRows}
+																emptyLabel={t('noCatalogPricing')}
+																tableTitle={t('catalogWindowPricesHint')}
+																billingCurrencyCode={billingCurrency}
+															/>
+														) : null}
+													</li>
+												);
+											})}
+										</ul>
 									</div>
+								) : null}
+									</div>
+									</RoutePricePanel>
 								</div>
 
 								<div className="flex min-h-0 min-w-0 flex-col">
@@ -925,6 +1171,7 @@ export function RouteModal(props: Props) {
 											subtitle={t('pricingFormulaHint')}
 											headerEndBeside="subtitle"
 											headerEnd={
+												catalogScheduleLocked ? null : (
 												<button
 													type="button"
 													onClick={() =>
@@ -937,6 +1184,7 @@ export function RouteModal(props: Props) {
 																	end: '08:00',
 																	charged_factor: '1',
 																	metered_factor: '1',
+																	days: [],
 																},
 															],
 														})
@@ -947,17 +1195,51 @@ export function RouteModal(props: Props) {
 												>
 													<PlusIcon className="h-3.5 w-3.5" aria-hidden />
 												</button>
+												)
 											}
 										>
 											<DailyScheduleEditor
-												windows={formData.schedule_windows}
+												windows={editorScheduleWindows}
 												onChange={(schedule_windows) => onFormChange({ ...formData, schedule_windows })}
+												lockWindows={catalogScheduleLocked}
 												emptyLabel={t('scheduleEmpty')}
 												startLabel={t('scheduleStart')}
 												endLabel={t('scheduleEnd')}
 												chargedFactorLabel={t('scheduleChargedFactor')}
 												meteredFactorLabel={t('scheduleMeteredFactor')}
 												removeLabel={tCommon('delete')}
+												renderWindowExtra={
+													catalogScheduleLocked &&
+													selectedModel &&
+													!selectedModelIsImage &&
+													!selectedModelIsAudio &&
+													catalogStandardTierRows.length > 0
+														? (i) => (
+																<ScheduleWindowEffectivePrices
+																	billingCurrency={billingCurrency}
+																	catalogFactor={catalogScheduleWindows[i]?.factor ?? 1}
+																	chargedFactorText={editorScheduleWindows[i]?.charged_factor ?? ''}
+																	meteredFactorText={editorScheduleWindows[i]?.metered_factor ?? ''}
+																	model={selectedModel}
+																/>
+															)
+														: undefined
+												}
+												dayLabels={{
+													days: t('scheduleDays'),
+													everyday: t('scheduleEveryday'),
+													weekdays: t('scheduleWeekdays'),
+													weekend: t('scheduleWeekend'),
+													weekdayShort: [
+														t('weekdayMon'),
+														t('weekdayTue'),
+														t('weekdayWed'),
+														t('weekdayThu'),
+														t('weekdayFri'),
+														t('weekdaySat'),
+														t('weekdaySun'),
+													],
+												}}
 											/>
 										</RoutePricePanel>
 									</div>

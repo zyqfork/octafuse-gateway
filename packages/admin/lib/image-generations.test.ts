@@ -3,6 +3,7 @@ import { describe, it } from 'node:test';
 import {
 	IMAGE_GENERATIONS_BODY_TEMPLATE,
 	imageRequestMetaFromBody,
+	openaiEditImageFormField,
 	parseImagesGenerationsResponse,
 } from './image-generations';
 
@@ -27,6 +28,30 @@ describe('image-generations helpers', () => {
 		assert.equal(parsed.images[1]?.kind, 'url');
 		assert.match(parsed.usageHint ?? '', /2 images/);
 		assert.match(parsed.usageHint ?? '', /quality=low/);
+	});
+
+	it('parseImagesGenerationsResponse extracts DashScope multimodal image URLs', () => {
+		const json = JSON.stringify({
+			output: {
+				choices: [
+					{
+						message: {
+							content: [{ image: 'https://oss.example.com/a.png' }],
+						},
+					},
+				],
+			},
+		});
+		const parsed = parseImagesGenerationsResponse(json, { size: '1024*1024', n: 1 });
+		assert.equal(parsed.count, 1);
+		assert.equal(parsed.images[0]?.kind, 'url');
+		assert.equal(parsed.images[0]?.src, 'https://oss.example.com/a.png');
+		assert.match(parsed.usageHint ?? '', /1 image/);
+	});
+
+	it('openaiEditImageFormField uses image[] only for multiple files', () => {
+		assert.equal(openaiEditImageFormField(1), 'image');
+		assert.equal(openaiEditImageFormField(2), 'image[]');
 	});
 
 	it('imageRequestMetaFromBody reads quality/size/n', () => {

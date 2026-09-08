@@ -1,5 +1,6 @@
 'use client';
 
+import { useMemo } from 'react';
 import { PaperAirplaneIcon, StopIcon } from '@heroicons/react/24/outline';
 import { useTranslations } from 'next-intl';
 import { RequestTargetUrl } from '@/components/request-target-url';
@@ -17,6 +18,9 @@ import {
 	matchPlaygroundLlmSample,
 	playgroundLlmFamilyForRoute,
 	playgroundModelHintFromRoute,
+	previewPlaygroundMergedBody,
+	previewPlaygroundOutboundHeaderRows,
+	splitPlaygroundCustomParams,
 	PLAYGROUND_LLM_SAMPLE_IDS,
 	type PlaygroundLlmSampleId,
 } from '../playground-utils';
@@ -37,6 +41,7 @@ type Props = {
 	selected: RouteListRow | null;
 	selectedUsesDashScopeRealtime: boolean;
 	imageSendBlocked: boolean;
+	selectedImageUsesDashScope: boolean;
 	audioSendBlocked: boolean;
 	selectedIsImage: boolean;
 	selectedIsAudio: boolean;
@@ -55,8 +60,7 @@ type Props = {
 	geminiAction: GeminiAction;
 	onGeminiActionChange: (action: GeminiAction) => void;
 	lastSentWireBody: string | null;
-	wireOpen: boolean;
-	onWireOpenChange: (open: boolean) => void;
+	lastSentWireHeaders: Record<string, string> | null;
 };
 
 export function PlaygroundRequestPanel({
@@ -74,6 +78,7 @@ export function PlaygroundRequestPanel({
 	selected,
 	selectedUsesDashScopeRealtime,
 	imageSendBlocked,
+	selectedImageUsesDashScope,
 	audioSendBlocked,
 	selectedIsImage,
 	selectedIsAudio,
@@ -92,8 +97,7 @@ export function PlaygroundRequestPanel({
 	geminiAction,
 	onGeminiActionChange,
 	lastSentWireBody,
-	wireOpen,
-	onWireOpenChange,
+	lastSentWireHeaders,
 }: Props) {
 	const t = useTranslations('playground');
 	const tCommon = useTranslations('common');
@@ -106,6 +110,34 @@ export function PlaygroundRequestPanel({
 	const llmSample = llmFamily
 		? matchPlaygroundLlmSample(llmFamily, bodyText, playgroundModelHintFromRoute(selected))
 		: null;
+	const mergedPreview = useMemo(
+		() =>
+			previewPlaygroundMergedBody({
+				bodyText,
+				customParams: selected?.custom_params,
+				upstreamProtocol: selected?.upstream_protocol,
+				providerModelName: selected?.provider_model_name,
+			}),
+		[bodyText, selected?.custom_params, selected?.upstream_protocol, selected?.provider_model_name],
+	);
+	const routeHeaderRows = useMemo(
+		() =>
+			previewPlaygroundOutboundHeaderRows({
+				customParams: selected?.custom_params,
+				upstreamProtocol: selected?.upstream_protocol,
+				sentHeaders: lastSentWireHeaders,
+			}),
+		[selected?.custom_params, selected?.upstream_protocol, lastSentWireHeaders],
+	);
+	const actualBodyJson = lastSentWireBody ?? (mergedPreview.status === 'preview' ? mergedPreview.json : null);
+	const actualBodyHint = lastSentWireBody
+		? t('sentBodyHint')
+		: mergedPreview.status === 'invalid'
+			? t('sentBodyInvalidJson')
+			: splitPlaygroundCustomParams(selected?.custom_params).forceOverrideBody
+				? t('sentBodyPreviewHintForceOverride')
+				: t('sentBodyPreviewHint');
+	const headerHint = lastSentWireHeaders ? t('sentHeadersHintSent') : t('sentHeadersHint');
 	const sampleLabel = (id: PlaygroundLlmSampleId) =>
 		id === 'connectivity' ? t('templateConnectivity') : id === 'tools' ? t('templateToolStream') : t('templateReasoning');
 	const llmSampleSwitcher = llmFamily ? (
@@ -245,7 +277,7 @@ export function PlaygroundRequestPanel({
 							<label className={labelClass}>{t('audioFile')}</label>
 							<input
 								type="file"
-								accept="audio/*,.mp3,.wav,.m4a,.webm,.ogg,.flac"
+								accept="audio/*,.mp3,.wav,.m4a,.webm,.ogg,.flac,.pcm"
 								disabled={sending}
 								className={`${inputClass} file:mr-3 file:rounded file:border-0 file:bg-blue-50 file:px-2 file:py-1 file:text-xs file:font-medium file:text-blue-700`}
 								onChange={(e) => onAudioFileChange(e.target.files?.[0] ?? null)}
@@ -279,36 +311,42 @@ export function PlaygroundRequestPanel({
 
 			{selectedIsImage && !selectedIsAudio && !imageSendBlocked ? (
 				<>
-					<fieldset className="flex flex-wrap items-center gap-4 rounded-md border border-gray-200 px-3 py-2 text-sm">
-						<legend className="sr-only">{t('imageOperation')}</legend>
-						<span className="font-medium text-gray-600">{t('imageOperation')}</span>
-						<label className="inline-flex cursor-pointer items-center gap-2">
-							<input
-								type="radio"
-								name="playgroundImageOperation"
-								className="text-blue-600 focus:ring-blue-500"
-								checked={imageOperation === 'generations'}
-								onChange={() => onImageOperationChange('generations')}
-								disabled={sending}
-							/>
-							generations
-						</label>
-						<label className="inline-flex cursor-pointer items-center gap-2">
-							<input
-								type="radio"
-								name="playgroundImageOperation"
-								className="text-blue-600 focus:ring-blue-500"
-								checked={imageOperation === 'edits'}
-								onChange={() => onImageOperationChange('edits')}
-								disabled={sending}
-							/>
-							edits
-						</label>
-					</fieldset>
-					<p className="text-xs text-gray-500">
-						{imageOperation === 'edits' ? t('imageEditsHint') : t('imageGenerationsHint')}
-					</p>
-					{imageOperation === 'edits' ? (
+					{selectedImageUsesDashScope ? (
+						<p className="text-xs text-gray-500">{t('imageDashScopeHint')}</p>
+					) : (
+						<>
+							<fieldset className="flex flex-wrap items-center gap-4 rounded-md border border-gray-200 px-3 py-2 text-sm">
+								<legend className="sr-only">{t('imageOperation')}</legend>
+								<span className="font-medium text-gray-600">{t('imageOperation')}</span>
+								<label className="inline-flex cursor-pointer items-center gap-2">
+									<input
+										type="radio"
+										name="playgroundImageOperation"
+										className="text-blue-600 focus:ring-blue-500"
+										checked={imageOperation === 'generations'}
+										onChange={() => onImageOperationChange('generations')}
+										disabled={sending}
+									/>
+									generations
+								</label>
+								<label className="inline-flex cursor-pointer items-center gap-2">
+									<input
+										type="radio"
+										name="playgroundImageOperation"
+										className="text-blue-600 focus:ring-blue-500"
+										checked={imageOperation === 'edits'}
+										onChange={() => onImageOperationChange('edits')}
+										disabled={sending}
+									/>
+									edits
+								</label>
+							</fieldset>
+							<p className="text-xs text-gray-500">
+								{imageOperation === 'edits' ? t('imageEditsHint') : t('imageGenerationsHint')}
+							</p>
+						</>
+					)}
+					{imageOperation === 'edits' && !selectedImageUsesDashScope ? (
 						<div>
 							<label className={labelClass}>{t('referenceImages')}</label>
 							<input
@@ -376,42 +414,80 @@ export function PlaygroundRequestPanel({
 				</fieldset>
 			) : null}
 
-			<div className="flex min-h-0 flex-1 flex-col">
-				<div className="mb-1 flex items-center justify-between gap-2">
-					<label className="text-xs font-medium uppercase tracking-wider text-gray-500">JSON</label>
-					{llmSampleSwitcher}
+			<div className="flex min-h-0 flex-1 flex-col gap-3">
+				<div className="shrink-0">
+					<div className="mb-1 flex items-center justify-between gap-2">
+						<label className="text-xs font-medium uppercase tracking-wider text-gray-500" title={headerHint}>
+							{t('sentHeaders')}
+						</label>
+						{lastSentWireBody ? (
+							<span className="text-[11px] font-medium text-emerald-700">{t('sentBodySourceSent')}</span>
+						) : mergedPreview.status === 'preview' ? (
+							<span className="text-[11px] font-medium text-slate-500">{t('sentBodySourcePreview')}</span>
+						) : null}
+					</div>
+					<div className={`${codeBlockClass} max-h-36 overflow-y-auto p-0`}>
+						{routeHeaderRows.length === 0 ? (
+							<p className="px-3 py-2 text-gray-400">{t('sentHeadersEmpty')}</p>
+						) : (
+							<ul className="divide-y divide-gray-100">
+								{routeHeaderRows.map((row) => {
+									const fromCustom = row.source === 'custom_params';
+									return (
+										<li
+											key={`${row.source}:${row.name}`}
+											className={`grid grid-cols-1 gap-0.5 px-3 py-1.5 sm:grid-cols-[minmax(8rem,16rem)_minmax(0,1fr)_auto] sm:items-baseline sm:gap-3 ${
+												fromCustom ? 'bg-amber-50' : ''
+											}`}
+										>
+											<span className="truncate font-mono text-xs font-semibold text-gray-800" title={row.name}>
+												{row.name}
+											</span>
+											<span className="min-w-0 break-all font-mono text-xs text-gray-700" title={row.value}>
+												{row.value}
+											</span>
+											<span
+												className={`w-fit shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold ${
+													fromCustom ? 'bg-amber-100 text-amber-900' : 'bg-slate-100 text-slate-600'
+												}`}
+											>
+												{fromCustom ? t('sentHeadersSourceCustomParams') : t('sentHeadersSourceProvider')}
+											</span>
+										</li>
+									);
+								})}
+							</ul>
+						)}
+					</div>
 				</div>
-				<textarea
-					value={bodyText}
-					onChange={(e) => onBodyTextChange(e.target.value)}
-					rows={12}
-					className={`${inputClass} min-h-[180px] flex-1 font-mono text-sm`}
-					spellCheck={false}
-				/>
+
+				<div className="grid min-h-0 flex-1 grid-cols-1 gap-3 xl:grid-cols-2 xl:items-stretch">
+					<div className="flex min-h-0 min-w-0 flex-col">
+						<div className="mb-1 flex items-center justify-between gap-2">
+							<label className="text-xs font-medium uppercase tracking-wider text-gray-500">{t('inputBody')}</label>
+							{llmSampleSwitcher}
+						</div>
+						<textarea
+							value={bodyText}
+							onChange={(e) => onBodyTextChange(e.target.value)}
+							rows={12}
+							className={`${inputClass} min-h-[180px] flex-1 font-mono text-sm`}
+							spellCheck={false}
+						/>
+					</div>
+					<div className="flex min-h-0 min-w-0 flex-col">
+						<label className="mb-1 text-xs font-medium uppercase tracking-wider text-gray-500" title={actualBodyHint}>
+							{t('sentBody')}
+						</label>
+						<pre className={`${codeBlockClass} min-h-[180px] flex-1 overflow-y-auto`}>
+							{actualBodyJson ?? '—'}
+						</pre>
+					</div>
+				</div>
 			</div>
 
 			{bodyError ? (
 				<div className="rounded-md border border-red-200 bg-red-50 p-2.5 text-sm text-red-600">{bodyError}</div>
-			) : null}
-
-			{lastSentWireBody ? (
-				<div className="border-t border-gray-100 pt-2">
-					<button
-						type="button"
-						onClick={() => onWireOpenChange(!wireOpen)}
-						className="flex w-full items-center justify-between text-left text-xs font-medium text-gray-600 hover:text-gray-900"
-						aria-expanded={wireOpen}
-					>
-						<span>{t('sentBody')}</span>
-						<span className="text-gray-400">{wireOpen ? '▾' : '▸'}</span>
-					</button>
-					{wireOpen ? (
-						<div className="mt-2 space-y-1">
-							<p className="text-[11px] text-gray-500">{t('sentBodyHint')}</p>
-							<pre className={codeBlockClass}>{lastSentWireBody}</pre>
-						</div>
-					) : null}
-				</div>
 			) : null}
 		</section>
 	);

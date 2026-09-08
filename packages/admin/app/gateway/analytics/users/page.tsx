@@ -41,7 +41,7 @@ export default function UserUsagePage() {
   const [sortKey, setSortKey] = useState<SortKey>('request_count');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
   const [tokenDisplayMode, setTokenDisplayMode] = useState<TokenDisplayMode>('compact');
-  const [expandedUserEmail, setExpandedUserEmail] = useState<string | null>(null);
+  const [expandedUserEmails, setExpandedUserEmails] = useState<Set<string>>(() => new Set());
   const [modelRowsByUser, setModelRowsByUser] = useState<Record<string, ModelUsageRow[]>>({});
   const [modelRowsLoading, setModelRowsLoading] = useState<Record<string, boolean>>({});
   const { currency: billingCurrency } = useBillingCurrency();
@@ -58,7 +58,7 @@ export default function UserUsagePage() {
         if (data.success) {
           setRows(data.data ?? []);
           setCommittedQuery(rangeValue);
-          setExpandedUserEmail(null);
+          setExpandedUserEmails(new Set());
           setModelRowsByUser({});
           setModelRowsLoading({});
         }
@@ -87,13 +87,14 @@ export default function UserUsagePage() {
   };
 
   const toggleUserModels = async (userEmail: string) => {
-    if (expandedUserEmail === userEmail) {
-      setExpandedUserEmail(null);
-      return;
-    }
-
-    setExpandedUserEmail(userEmail);
-    if (modelRowsByUser[userEmail] || modelRowsLoading[userEmail]) return;
+    const isCurrentlyExpanded = expandedUserEmails.has(userEmail);
+    setExpandedUserEmails((prev) => {
+      const next = new Set(prev);
+      if (next.has(userEmail)) next.delete(userEmail);
+      else next.add(userEmail);
+      return next;
+    });
+    if (isCurrentlyExpanded || modelRowsByUser[userEmail] || modelRowsLoading[userEmail]) return;
 
     setModelRowsLoading((prev) => ({ ...prev, [userEmail]: true }));
     try {
@@ -136,6 +137,8 @@ export default function UserUsagePage() {
       'last_active_at',
       'budget_max',
       'budget_spent',
+      'wallet_granted',
+      'wallet_spent',
       'budget_usage_rate_pct',
       'success_rate_pct',
       'error_count',
@@ -154,6 +157,8 @@ export default function UserUsagePage() {
       r.last_active_at ?? '',
       r.budget_max != null ? String(r.budget_max) : '',
       String(r.budget_spent),
+      String(r.wallet_granted ?? 0),
+      String(r.wallet_spent ?? 0),
       r.budget_usage_rate != null ? String(r.budget_usage_rate) : '',
       String(r.success_rate),
       String(r.error_count),
@@ -201,6 +206,7 @@ export default function UserUsagePage() {
                 <Th label={tA('columns.models')} columnKey="distinct_models" />
                 <Th label={tA('columns.lastActive')} columnKey="last_active_at" />
                 <Th label={tA('columns.budgetUsage')} columnKey="budget_usage_rate" />
+                <Th label={tA('columns.wallet')} columnKey="wallet_granted" />
                 <Th label={tA('columns.successRate')} columnKey="success_rate" />
               </tr>
             </thead>
@@ -213,7 +219,7 @@ export default function UserUsagePage() {
                 logQuery.set('user_email', r.user_email);
                 logQuery.set('start_date', start_date);
                 logQuery.set('end_date', end_date);
-                const isExpanded = expandedUserEmail === r.user_email;
+                const isExpanded = expandedUserEmails.has(r.user_email);
                 const modelRows = modelRowsByUser[r.user_email] ?? [];
                 const isModelRowsLoading = modelRowsLoading[r.user_email] === true;
                 return (
@@ -261,6 +267,9 @@ export default function UserUsagePage() {
                           tCommon('noData')
                         )}
                       </td>
+                      <td className="px-4 py-3 text-sm tabular-nums text-gray-600">
+                        {formatGatewayMoneyCode(Number(r.wallet_granted ?? 0) - Number(r.wallet_spent ?? 0), billingCurrency, 2)}
+                      </td>
                       <td className="px-4 py-3 text-sm">
                         <span className={successRateClassName(r.success_rate)}>
                           {r.success_rate.toFixed(1)}%
@@ -269,7 +278,7 @@ export default function UserUsagePage() {
                     </tr>
                     {isExpanded ? (
                       <tr key={`${r.user_email}:models`} className="bg-blue-50/60">
-                        <td colSpan={11} className="border-l-4 border-blue-300 px-5 py-4">
+                        <td colSpan={12} className="border-l-4 border-blue-300 px-5 py-4">
                           {isModelRowsLoading ? (
                             <div className="py-4 text-sm text-gray-500">{tA('loadingModelUsage')}</div>
                           ) : modelRows.length === 0 ? (

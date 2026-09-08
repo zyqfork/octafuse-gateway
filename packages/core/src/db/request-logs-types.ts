@@ -34,6 +34,8 @@ export type InsertRequestLogParams = {
 	meteredCost: number;
 	standardCost: number;
 	chargedCost: number;
+	/** 本次从永久池扣掉的部分；缺省 0 */
+	chargedWalletCost?: number;
 	routeGroup: string;
 	status: 'success' | 'error' | 'incomplete' | 'cancelled';
 	latencyMs: number | null;
@@ -67,4 +69,6 @@ export type InsertRequestLogParams = {
 	audioDurationSeconds?: number | null;
 	/** TTS：上游返回的有效计费字符数 */
 	audioCharacters?: number | null;
+	/** 请求打到的入口 Host（只记录，不做准入） */
+	ingressHost?: string | null;
 };

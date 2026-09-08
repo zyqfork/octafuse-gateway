@@ -4,6 +4,7 @@
  */
 import type {
 	ApiKeyBudgetAuditLogRow,
+	ApiKeyRateLimit,
 	GlobalApiKeyBudgetAuditLogRow,
 	RequestLogRow,
 } from '@octafuse/core';
@@ -49,6 +50,12 @@ export type AdminUserUpdateInput = {
 	external_user_id?: string | null;
 	/** `{ "<models.id>": factor }`；null / {} 清空 */
 	charged_cost_factors?: Record<string, number> | null;
+	/** 永久额度累计发放（绝对值运维修正） */
+	wallet_granted?: number | null;
+	/** 永久额度累计消耗（绝对值运维修正） */
+	wallet_spent?: number | null;
+	/** 用户层限流 JSON；`null` 表示该层不限。形状与 Key `rate_limit` 相同。 */
+	rate_limit?: ApiKeyRateLimit | null;
 };
 
 /** ---------- `/admin/users/:id/budget/transition` 请求体 ---------- */
@@ -95,6 +102,8 @@ export type AdminKeyUpdateInput = {
 	metadata_replace?: unknown;
 	status?: string;
 	name?: string | null;
+	/** null = unlimited; omit = unchanged */
+	rate_limit?: ApiKeyRateLimit | null;
 	reason?: string;
 };
 
@@ -124,6 +133,12 @@ export type AdminProviderImportCatalogItem = {
 	/** 序列化后的 endpoints JSON（可 null） */
 	endpoints: string | null;
 	description: string | null;
+	/** 官网 / 密钥页 / 可选邀请链接；不写入 providers 表。 */
+	links?: {
+		platform?: string;
+		api_keys?: string;
+		referral?: string;
+	};
 };
 
 /** `POST /admin/providers/import` 请求体：导入选中的 catalog 键（`GET .../catalog` 返回的 `id`）。 */
@@ -246,6 +261,12 @@ export type AdminProviderRow = {
 	vendor_key?: string;
 	/** 由内置 Provider 预设动态推导的产品级图标，不持久化。 */
 	icon_key?: string;
+	/** 由内置预设叠加的官网 / 密钥 / 邀请链接，不持久化。 */
+	catalog_links?: {
+		platform?: string;
+		api_keys?: string;
+		referral?: string;
+	};
 	endpoints: string | null;
 	/** 列表/详情为脱敏预览；明文仅经 `GET /:id/api-key` */
 	api_key?: string;
@@ -301,8 +322,12 @@ export type AdminKeyListItem = {
 	budget_spent: number;
 	budget_period: string;
 	budget_reset_at: string | null;
+	wallet_granted?: number;
+	wallet_spent?: number;
 	status: string;
 	metadata: string | null;
+	last_used_at?: string | null;
+	rate_limit?: ApiKeyRateLimit | null;
 	created_at: string;
 	updated_at: string;
 	[key: string]: unknown;
@@ -359,7 +384,12 @@ export type AdminKeyUpdateOutput =
 			budget_spent: number;
 			budget_period: string;
 			budget_reset_at: string | null;
+			wallet_granted?: number;
+			wallet_spent?: number;
+			wallet_balance?: number;
 			metadata?: JsonObject;
+			last_used_at?: string | null;
+			rate_limit?: ApiKeyRateLimit | null;
 	  };
 
 export type AdminKeyDetailOutput = {
@@ -374,8 +404,13 @@ export type AdminKeyDetailOutput = {
 	budget_spent: number;
 	budget_period: string;
 	budget_reset_at: string | null;
+	wallet_granted?: number;
+	wallet_spent?: number;
+	wallet_balance?: number;
 	status: string;
 	metadata?: JsonObject;
+	last_used_at?: string | null;
+	rate_limit?: ApiKeyRateLimit | null;
 	created_at: string;
 	updated_at: string;
 	spend: number;
@@ -548,9 +583,27 @@ export type AdminUserAnalyticsRow = {
 	last_active_at: unknown;
 	budget_max: number | null;
 	budget_spent: number;
+	wallet_granted?: number | null;
+	wallet_spent?: number | null;
 	budget_usage_rate: number | null;
 	success_rate: number;
 	error_count: number;
+};
+
+export type AdminKeyAnalyticsRow = {
+	api_key_id: string | null;
+	key_name: string | null;
+	request_count: number;
+	input_tokens: number;
+	output_tokens: number;
+	charged_cost: number;
+	metered_cost: number;
+	standard_cost: number;
+	distinct_models: number;
+	last_active_at: unknown;
+	success_count: number;
+	error_count: number;
+	success_rate: number;
 };
 
 export type AdminReliabilityProviderRow = {

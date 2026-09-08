@@ -1,6 +1,6 @@
 # 文生图模型（Image Models）
 
-本文整理 Gateway 当前支持的 **OpenAI Images** 文生图模型：预设 catalog、Provider 配置、参数差异、计费与预检、运营验收。
+本文整理 Gateway 当前支持的文生图模型：预设 catalog、供应商配置、参数差异、计费与预检、运营验收。客户端入口统一为 OpenAI Images；阿里云百炼千问 / 万相走 DashScope 协议转换，见 [DashScope 生图架构](../architecture/dashscope-image.md)。
 
 API 字段细节见 [用户接口 · Images](../api/user.md#images图片生成--编辑)；逐步验收清单见 [Admin API · 运维验收](../api/admin.md#运维验收文生图模型-gpt-image-2)。
 
@@ -10,8 +10,8 @@ API 字段细节见 [用户接口 · Images](../api/user.md#images图片生成--
 |----|------|
 | 入口 | **`POST /v1/images/generations`**；OpenAI 另有 **`POST /v1/images/edits`**（multipart） |
 | 不走 Chat | 文生图 **不** 走 `/v1/chat/completions` |
-| 驱动 | `packages/proxy` OpenAI Images driver；failover 复用 `failoverDispatch` |
-| 路由协议 | `model_routes.upstream_protocol` **锁定 `openai`**（anthropic/gemini 保存应 400） |
+| 驱动 | OpenAI 透传走 `openai-images-driver`；DashScope 转换走 `dashscope-images-driver`；failover 复用 `failoverDispatch` |
+| 路由协议 | 对外请求协议锁定 `openai`；上游可以是 `openai` 透传，也可以是 `dashscope` + `images.generations.multimodal` |
 | Kind 判定 | `output_modalities` 含 **`image`**（勿用 input 含 image——多模态 LLM 也会有） |
 | Catalog 列表 | 默认 `/v1/models` **不含** 纯 image 模型；需 `kind=image` / `kind=all`，或直接打 Images API |
 | 计费权威 | **双模式**：`pricing_profile.image_billing_mode` = `token`（usage 分项 × `image_*`）或 `per_image`（确认输出张数 × `image.default`，可选参考图 `image.input`） |
@@ -25,12 +25,13 @@ API 字段细节见 [用户接口 · Images](../api/user.md#images图片生成--
 - 智谱：`packages/admin/lib/model-presets/zhipu-image.json`
 - xAI：`packages/admin/lib/model-presets/xai-image.json`
 - Google：`packages/admin/lib/model-presets/google-image.json`
+- 阿里云百炼：`packages/admin/lib/model-presets/aliyun-image.json`
 
 Admin → Models → Import 勾选导入；**同 id 已存在不会覆盖**——改价需删后 re-import 或 PATCH。
 
 | Catalog id | 展示名 | Vendor | 典型区域 | 图生图 / 编辑 | 计费模式 |
 |------------|--------|--------|----------|---------------|----------|
-| `gpt-image-2` | GPT Image 2 | openai | 海外 | **`/v1/images/edits`**（multipart，最多 5 张） | **`token`**（官方 $/1M） |
+| `gpt-image-2` | GPT Image 2 | openai | 海外 | **`/v1/images/edits`**（multipart：1 张 `image`，多张 `image[]`，最多 5 张） | **`token`**（官方 $/1M） |
 | `doubao-seedream-5-0` | Doubao Seedream 5.0 | bytedance | 国内（火山方舟） | generations + JSON **`image`** | **`per_image`**（¥0.22/张一口价） |
 | `doubao-seedream-5-0-pro` | Doubao Seedream 5.0 Pro | bytedance | 国内（火山方舟） | 同上 | **`per_image`**（¥0.30/¥0.60 按像素档 + 参考图） |
 | `glm-image` | GLM Image | zhipu | 国内 / Z.AI 国际 | generations（按上游） | **`per_image`**（¥0.1/次） |
@@ -38,13 +39,17 @@ Admin → Models → Import 勾选导入；**同 id 已存在不会覆盖**—�
 | `grok-imagine-image-quality` | Grok Imagine Image Quality | xai | 海外 | generations（及上游 edits） | **`per_image`**（1K $0.05 / 2K $0.07；input $0.01） |
 | `gemini-3.1-flash-image` | Gemini 3.1 Flash Image | google | 海外 | generations（OpenAI 兼容层） | **`token`**（Nano Banana 2） |
 | `gemini-3-pro-image-preview` | Gemini 3 Pro Image Preview | google | 海外 | 同上 | **`token`**（Nano Banana Pro） |
+| `qwen-image-3.0-pro` | Qwen Image 3.0 Pro | aliyun | 国内（百炼） | generations + JSON `image`（DashScope 转换） | **`per_image`**（¥0.25/¥0.50 按 1K/2K + 参考图；档位由响应 usage 反推） |
+| `qwen-image-3.0` | Qwen Image 3.0 | aliyun | 国内（百炼） | 同上 | **`per_image`**（¥0.18/张 + 参考图） |
+| `wan2.7-image-pro` | Wan 2.7 Image Pro | aliyun | 国内（百炼） | 同上 | **`per_image`**（¥0.50/张一口价） |
+| `wan2.7-image` | Wan 2.7 Image | aliyun | 国内（百炼） | 同上 | **`per_image`**（¥0.20/张一口价） |
 
 约定：
 
 - Catalog id **=** 上游 `provider_model_name`（与 `gpt-image-2` 一致）；若控制台用推理接入点，Route 可填 `ep-…`。
 - 模型预设 **不** 写 `suggested_provider_model_name` / `suggested_custom_params`；默认参数由客户端或 Route `custom_params` 注入。
-- 旧 id（如 `doubao-seedream-4-5-*`、`cogview-*`、`gemini-2.5-flash-image`、`grok-imagine-image-pro`）不进静态预设；库里若仍有旧行需手工清理。
-- 新增厂商：补 `<vendor>-image.json` + Provider 模板（须有 OpenAI Images `images.generations`）+ 本文表格。阿里云百炼万相 / Qwen-Image 等非 OpenAI Images 路径暂不收录。
+- 旧 id（如 `doubao-seedream-4-5-*`、`cogview-*`、`gemini-2.5-flash-image`、`grok-imagine-image-pro`、`qwen-image` / `qwen-image-plus` / `qwen-image-2.0-*` / `wan2.6-*` / `wanx*`）不进静态预设；库里若仍有旧行需手工清理。
+- 新增厂商：补 `<vendor>-image.json` + 供应商模板 + 本文表格。OpenAI 兼容上游写 `images.generations`；DashScope 原生写 `images.generations.multimodal`。
 
 ## Provider 配置
 
@@ -88,12 +93,29 @@ Coding Plan / Agent Plan 模板路径不同，**勿与标准 `/api/v3` 混用**�
 - 官方 OpenAI 兼容层文档常见示例含 `gemini-3-pro-image-preview`；`gemini-3.1-flash-image` 为当前稳定型号，若兼容层拒识再按 Google 文档改 Route `provider_model_name`。
 - 建议请求显式 `response_format=b64_json`（与 Google 兼容文档一致）。
 
+### 阿里云百炼（`qwen-image-3.0*` / `wan2.7-image*`）
+
+这四个模型**不支持** `compatible-mode` / OpenAI Images。客户端仍打 `POST /v1/images/generations`，路由必须做 OpenAI → DashScope 转换。同步端点是：
+
+```text
+POST {dashscope.base}/services/aigc/multimodal-generation/generation
+```
+
+- 模板 **Alibaba Cloud Bailian** / 国际版已有 `dashscope.base`，加上 capability 后自动派生上述 URL。**不要**把该路径写进 OpenAI 的 `images.generations`（那是 OpenAI 协议专用）。
+- 千问 Token Plan 没有 `dashscope.base`，预设已显式覆盖 `images.generations.multimodal`。Coding Plan 是 chat-only，不要用来跑生图。
+- 业务空间专属域名（`{WorkspaceId}.cn-beijing.maas.aliyuncs.com`）不做成预设；运维可把 `dashscope.base` 换成实际主机。
+- 路由：请求 `openai` / `images.generations`，上游 `dashscope` / `images.generations.multimodal`。千问选 `dashscope-image-qwen`（`n` 1–6），万相选 `dashscope-image-wan`（`n` 1–4）。
+- **万相默认 `n=4`**：官方关闭组图时不显式传 `n` 会一次出 4 张并按 4 张扣费。驱动永远显式下发 `n`，缺省为 1。
+- **千问 Pro 的 1K/2K 计价档无法从请求推断**：上游要 `"1024*1024"` 这类像素串；客户端仍可传 OpenAI 的 `"1024x1024"`，驱动会改写。档位从响应 `usage.output_image_type`（`qima_output_1k` / `qima_output_2k`）反推，回退用像素面积。`pricing_audit.size` 会是 `1k` / `2k`。
+- 图生图走 generations + JSON `image`（与 Seedream 约定一致），不做 `/v1/images/edits`。默认返回 `data[].url`（OSS，约 24 小时过期）；显式 `response_format=b64_json` 时网关下载并转 base64，失败降级回 url。
+- 架构细节见 [DashScope 生图架构](../architecture/dashscope-image.md)。
+
 ## 参数对照
 
 | 维度 | `gpt-image-2` | Seedream 5（`doubao-seedream-5-0-*`） |
 |------|---------------|--------------------------------------|
 | 文生图 | `POST /v1/images/generations` | 同左 |
-| 参考图 / 编辑 | **`POST /v1/images/edits`** multipart `image` 文件 | **无 edits**；`generations` + JSON `image`（URL / data URL / 数组） |
+| 参考图 / 编辑 | **`POST /v1/images/edits`** multipart：1 张用 `image`，多张用 `image[]` | **无 edits**；`generations` + JSON `image`（URL / data URL / 数组） |
 | `size` | `auto` / `1024x1024` / `1024x1536` / `1536x1024` 等 | `2K` / `3K` / `4K` 或 `WxH` 像素 |
 | `quality` | `auto` / `low` / `medium` / `high` | 通常不用 |
 | `background` | 支持（如 `auto`） | 无 |
@@ -101,7 +123,7 @@ Coding Plan / Agent Plan 模板路径不同，**勿与标准 `/api/v3` 混用**�
 | `sequential_image_generation` (+ `*_options`) | — | 可选，显式透传 |
 | `optimize_prompt_options` | — | 可选，显式透传 |
 | `response_format` | GPT Image 系列常直接 `b64_json` 且可能拒收该字段；**仅显式传入时透传** | 按上游 |
-| `n` | Gateway 首期仅 **1** | 同左 |
+| `n` | OpenAI 透传仅 **1**；DashScope 千问 1–6、万相 1–4 | 同左（透传仍为 1） |
 | `prompt` | 必填，最长 4000 | 同左 |
 
 透传实现：`packages/proxy/src/services/image-generation-extras.ts`（`applyOpenAiImageGenerationExtras`）。Route `custom_params` 与用户体合并规则见 [Route 默认参数合并](../api/user.md#route-默认参数合并)。
@@ -126,6 +148,24 @@ curl -sS "$GATEWAY_URL/v1/images/generations" \
   -d '{"model":"doubao-seedream-5-0","prompt":"海边灯塔水彩封面","size":"2K","n":1,"watermark":false}'
 ```
 
+阿里云百炼千问（像素串；Pro 的 2K 档由响应 usage 反推）：
+
+```bash
+curl -sS "$GATEWAY_URL/v1/images/generations" \
+  -H "Authorization: Bearer $USER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen-image-3.0-pro","prompt":"海边灯塔水彩封面","size":"2048*2048","n":1}'
+```
+
+阿里云百炼万相（允许 `2K` 缩写；不传 `n` 时网关仍显式下发 1）：
+
+```bash
+curl -sS "$GATEWAY_URL/v1/images/generations" \
+  -H "Authorization: Bearer $USER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"wan2.7-image","prompt":"海边灯塔水彩封面","size":"2K"}'
+```
+
 Seedream 图生图（勿打 `/edits`）：
 
 ```json
@@ -144,7 +184,7 @@ Seedream 图生图（勿打 `/edits`）：
 | 模式 | 适用 | 扣费权威 | `pricing_audit.kind` |
 |------|------|----------|----------------------|
 | **`token`** | gpt-image-2、Gemini Nano Banana | 上游 `usage` 分项 × tier `image_*` / text 单价 | `image_tokens` |
-| **`per_image`** | Seedream / GLM / Grok | 确认输出张数 × `image.default`（+ 可选参考图 `image.input`）；**无需 / 不计价 `tiers`** | `image_per_image` |
+| **`per_image`** | Seedream / GLM / Grok / 阿里云百炼 | 确认输出张数 × `image.default`（+ 可选参考图 `image.input`）；**无需 / 不计价 `tiers`** | `image_per_image` |
 
 再乘路由 `charged_factor` / `metered_factor`。Request log 另有结构化列 `billing_kind`、`input_image_count`、`output_image_count`。
 
@@ -204,6 +244,10 @@ charged ≈
 | `doubao-seedream-5-0` | **0.22** | **0.035** | 火山方舟一口价；BytePlus $0.035；**不按 4K 翻倍** |
 | `doubao-seedream-5-0-pro` | **0.30**（≤2.36MP）/ **0.60**（>2.36MP） | **0.045** / **0.09** | `by_size`：`2k`→低档，`3k`/`4k`→高档；`image.input` CNY **0.02** / USD **0.003**（官方首张免费网关暂按全量计） |
 | `glm-image` | **0.1** | **0.014** | 智谱官方 ¥0.1/次；USD ≈ ×7.14（国内权威 CNY） |
+| `qwen-image-3.0-pro` | **0.25**（1K）/ **0.50**（2K） | **0.036** / **0.071** | 百炼华北2 原价；`image.input` CNY **0.02** / USD **0.003**；USD = CNY ÷ 7 |
+| `qwen-image-3.0` | **0.18** | **0.026** | 1K/2K 同价；`image.input` 同上 |
+| `wan2.7-image-pro` | **0.50** | **0.071** | 一口价（含 4K 文生图）；官方输入不计费 |
+| `wan2.7-image` | **0.20** | **0.029** | 一口价，最高 2K；官方输入不计费 |
 | `grok-imagine-image-2.0` | **0.28** | **0.04** | xAI 官方一口价；CNY = USD ×7；价目页未单列参考图单价 |
 | `grok-imagine-image-quality` | **0.35**（1K）/ **0.49**（2K） | **0.05** / **0.07** | xAI 官方；CNY = USD ×7；`image.input.default` USD **0.01**（CNY **0.07**） |
 

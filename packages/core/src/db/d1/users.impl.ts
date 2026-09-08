@@ -2,6 +2,7 @@
  * D1：`users` 表。
  */
 import type { UserRow } from '../../types';
+import { parseApiKeyRateLimit } from '../../lib/api-key-rate-limit';
 import { roundGatewayMoney } from '../../lib/money-precision';
 import type { D1DatabaseClient } from '../../storage/database-client';
 import type { UsersRepository } from '../../storage/gateway-repository-interfaces';
@@ -22,8 +23,11 @@ type UserSqlRow = {
 	budget_spent: number;
 	budget_period: string;
 	budget_reset_at: string | null;
+	wallet_granted: number;
+	wallet_spent: number;
 	status: string;
 	metadata: string | null;
+	rate_limit: string | null;
 	charged_cost_factors: string | null;
 	external_system: string | null;
 	external_user_id: string | null;
@@ -40,8 +44,11 @@ function mapUserRow(r: UserSqlRow): UserRow {
 		budget_spent: roundGatewayMoney(Number(r.budget_spent)),
 		budget_period: r.budget_period,
 		budget_reset_at: r.budget_reset_at,
+		wallet_granted: roundGatewayMoney(Number(r.wallet_granted ?? 0)),
+		wallet_spent: roundGatewayMoney(Number(r.wallet_spent ?? 0)),
 		status: r.status,
 		metadata: r.metadata,
+		rate_limit: parseApiKeyRateLimit(r.rate_limit),
 		charged_cost_factors: r.charged_cost_factors ?? null,
 		external_system: r.external_system,
 		external_user_id: r.external_user_id,
@@ -159,7 +166,9 @@ export function createD1UsersRepository(db: D1DatabaseClient): UsersRepository {
 			resetBudget: boolean = true,
 			metadata?: string | null,
 			budget_spent_override?: number | null,
-			budget_base?: number | null
+			budget_base?: number | null,
+			wallet_granted?: number | null,
+			wallet_spent?: number | null
 		): Promise<boolean> {
 			const setClauses: string[] = ['budget_max = ?', 'budget_period = ?', 'budget_reset_at = ?', 'updated_at = datetime("now")'];
 			const bindValues: unknown[] = [
@@ -177,6 +186,14 @@ export function createD1UsersRepository(db: D1DatabaseClient): UsersRepository {
 				setClauses.push('budget_base = ?');
 				bindValues.push(budget_base != null ? roundGatewayMoney(budget_base) : 0);
 			}
+			if (wallet_granted !== undefined) {
+				setClauses.push('wallet_granted = ?');
+				bindValues.push(roundGatewayMoney(wallet_granted ?? 0));
+			}
+			if (wallet_spent !== undefined) {
+				setClauses.push('wallet_spent = ?');
+				bindValues.push(roundGatewayMoney(wallet_spent ?? 0));
+			}
 			if (metadata !== undefined) {
 				setClauses.push('metadata = ?');
 				bindValues.push(metadata);
@@ -193,6 +210,14 @@ export function createD1UsersRepository(db: D1DatabaseClient): UsersRepository {
 			const result = await raw
 				.prepare('UPDATE users SET status = ?, updated_at = datetime("now") WHERE id = ?')
 				.bind(status, id)
+				.run();
+			return result.meta.changes > 0;
+		},
+
+		async updateUserRateLimit(id: string, rateLimitJson: string | null): Promise<boolean> {
+			const result = await raw
+				.prepare('UPDATE users SET rate_limit = ?, updated_at = datetime("now") WHERE id = ?')
+				.bind(rateLimitJson, id)
 				.run();
 			return result.meta.changes > 0;
 		},

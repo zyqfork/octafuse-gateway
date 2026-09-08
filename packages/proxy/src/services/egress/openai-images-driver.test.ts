@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
+	appendOpenaiEditImages,
 	countValidImageResults,
+	isOpenaiEditImageFormKey,
 	normalizeImageCommonParams,
+	openaiEditImageFormField,
 	redactImageRequestForLog,
 	validateImageUpload,
 	IMAGE_GENERATION_TIMEOUT_MS,
@@ -41,6 +44,14 @@ describe('normalizeImageCommonParams', () => {
 		assert.equal(normalizeImageCommonParams({ prompt: 'hi', n: '2' }).ok, false);
 	});
 
+	it('allows n up to options.maxN while defaulting to 1', () => {
+		const allowed = normalizeImageCommonParams({ prompt: 'hi', n: 4 }, { maxN: 4 });
+		assert.equal(allowed.ok, true);
+		if (allowed.ok) assert.equal(allowed.n, 4);
+		assert.equal(normalizeImageCommonParams({ prompt: 'hi', n: 5 }, { maxN: 4 }).ok, false);
+		assert.equal(normalizeImageCommonParams({ prompt: 'hi', n: 2 }).ok, false);
+	});
+
 	it('rejects oversized prompt', () => {
 		const r = normalizeImageCommonParams({ prompt: 'x'.repeat(IMAGE_MAX_PROMPT_CHARS + 1) });
 		assert.equal(r.ok, false);
@@ -71,6 +82,35 @@ describe('validateImageUpload / countValidImageResults', () => {
 		assert.equal(countValidImageResults({ data: [{ b64_json: 'abc' }, { url: 'https://x' }] }), 2);
 		assert.equal(countValidImageResults({ data: [{ b64_json: '' }, {}] }), 0);
 		assert.equal(countValidImageResults(null), 0);
+	});
+});
+
+describe('openaiEditImageFormField', () => {
+	it('uses scalar image for one file and image[] for two or more', () => {
+		assert.equal(openaiEditImageFormField(0), 'image');
+		assert.equal(openaiEditImageFormField(1), 'image');
+		assert.equal(openaiEditImageFormField(2), 'image[]');
+		assert.equal(openaiEditImageFormField(5), 'image[]');
+	});
+
+	it('skips custom_params keys that would duplicate the image field', () => {
+		assert.equal(isOpenaiEditImageFormKey('image'), true);
+		assert.equal(isOpenaiEditImageFormKey('images'), true);
+		assert.equal(isOpenaiEditImageFormKey('image[]'), true);
+		assert.equal(isOpenaiEditImageFormKey('prompt'), false);
+	});
+
+	it('appends one file as image and many as image[]', () => {
+		const png = { filename: 'a.png', mimeType: 'image/png', bytes: new Uint8Array([1, 2, 3]) };
+		const one = new FormData();
+		appendOpenaiEditImages(one, [png]);
+		assert.equal(one.getAll('image').length, 1);
+		assert.equal(one.getAll('image[]').length, 0);
+
+		const many = new FormData();
+		appendOpenaiEditImages(many, [png, { ...png, filename: 'b.png' }]);
+		assert.equal(many.getAll('image').length, 0);
+		assert.equal(many.getAll('image[]').length, 2);
 	});
 });
 

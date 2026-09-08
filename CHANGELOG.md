@@ -1,5 +1,147 @@
 # Changelog
 
+## Unreleased
+
+### Patch Changes
+
+- **模型列表请求入口**：`GET /v1/models` 的 `model_info` 增加 `inbound`（`protocol` + `operation`），列出当前可见的 Chat Completions、Responses、Anthropic Messages 或 Gemini generateContent 入口。这是请求入口，不是上游协议；选哪条入口以及思考档仍由客户端维护。
+
+## 2.9.0
+
+### Minor Changes
+
+- [#156](https://github.com/OctaFuse/octafuse-gateway/pull/156) [`f4544a2`](https://github.com/OctaFuse/octafuse-gateway/commit/f4544a22bb647826ca4e92fb58d27a361ae898a2) Thanks [@dyc87112](https://github.com/dyc87112)! - OctaFuse Gateway v2.9.0 重点完善流量治理、用量观测和管理体验：管理员可以分别限制用户与单把 API Key 的请求频率，通过密钥分析和入口域名记录定位流量来源；管理后台总览、路由调试与 Cloudflare 多域名部署也同步升级。
+
+  ### Proxy
+
+  - **用户与 API Key 双层限流**：用户级 RPM 控制该用户所有 Key 的合计请求量，Key 级 RPM 控制单把密钥。两层独立执行，并按当前时刻向前回溯 60 秒，不会在 UTC 自然分钟切换时重置。
+  - **清晰的超限反馈**：超过任一层上限时返回 `429 gateway.rate_limited`，并通过 `Retry-After` 告知再次尝试前的等待时间；`GET /v1/me` 不参与两层计数。
+  - **入口与密钥观测**：请求日志新增 `ingress_host`，用于记录请求实际进入的 Host，但不参与访问控制；写入请求用量时同步更新 API Key 的 `last_used_at`。
+  - **路由自定义请求头**：`custom_params.headers` 作为上游 HTTP Headers 发送，不再混入 JSON 请求体；鉴权、Host、Content-Length 等受保护请求头不会被自定义值覆盖。
+  - **默认参数合并**：除 `headers` 外的 `custom_params` 继续作为请求体默认值，并与客户端 JSON 深度合并；客户端显式值优先，因此该配置不能作为强制参数上限。
+  - **计费记录一致性**：Chat、Responses、Anthropic Messages 和 Gemini 共用结构化的计费记录流程，统一整理用量、错误和上游请求 ID 后再写入日志；现有计费口径保持不变。
+  - **Images Edits 兼容**：单张参考图使用 `image`，多张参考图使用 `image[]`，提升不同 OpenAI 兼容上游的接收兼容性。
+
+  ### Admin
+
+  - **限流配置**：用户详情可设置用户合计 RPM，用户列表会同步展示该限制，Keys 页面可设置单 Key RPM；空值表示不限，`0` 表示拒绝所有计次请求，小数和负数会被界面与 Admin API 一致拒绝。
+  - **运营总览**：Dashboard 集中展示请求量、成功率、平均延迟、用户费用、趋势、热门模型、活跃用户、近期请求和错误信息。
+  - **密钥分析**：新增按 API Key 汇总的请求量、Token、费用和最近使用时间；用户请求日志支持按 `api_key_id` 筛选，便于定位具体客户端或应用。
+  - **分析页面对比**：模型、供应商和用户用量页面支持同时展开多条明细，减少逐项对比时反复开合。
+  - **路由调试**：路由编辑将上游请求头与 JSON 默认参数分开配置；Playground 可预览最终发送的请求头和上游请求体，鉴权类敏感请求头会自动脱敏。
+  - **供应商与模型目录**：新增 SiliconFlow 国际站导入模板并区分国内、国际端点，在供应商导入和配置界面补充平台或密钥页面快捷入口；新增 Gemini 3.8 Flash 模型预设，为 DeepSeek V4 Pro / Flash 的内置预设补齐工作日官方高峰时段，并修正 23 个阿里云百炼模型的 USD / CNY 预设价格。
+  - **自托管管理后台修复**：修复 Node / Docker 管理后台经反向代理访问时，创建或修改集成密钥可能被同源校验误判为 `403` 的问题；非同源写操作仍会被拒绝。
+  - **交互一致性**：多处保存、删除和异常反馈统一使用页面通知与确认对话框。
+
+  ### Core / 部署
+
+  - **迁移 0028**：`users.rate_limit` 保存用户共享限流，`api_keys.rate_limit` 保存单 Key 限流；`api_key_request_logs.ingress_host` 保存入口 Host，并增加 `ingress_host + created_at` 查询索引。D1、Postgres、MySQL 语义一致。
+  - **滚动窗口实现**：Key 与用户窗口分别维护过去 60 秒的请求时间，跨 UTC 自然分钟不会重置；实际超限层决定本次 `Retry-After`。
+  - **Cloudflare 多域名**：`PROXY_CUSTOM_DOMAIN` 与 `ADMIN_CUSTOM_DOMAIN` 支持以逗号分隔多个自定义域名；空白项会被忽略，重复域名会去重，单域名配置继续兼容。
+  - **计价展示修正**：同优先级、同权重路由在展示代表价格时优先采用当前综合倍率更低的路由，使目录折扣更贴近可用价格；实际请求仍遵循原有选路策略。
+
+  ### 文档
+
+  - **限流与观测**：补充用户 / Key 双层 RPM、滚动窗口、`Retry-After`、`GET /v1/me` 豁免、单实例软上限与入口 Host 的接口和数据模型说明。
+  - **路由请求配置**：明确自定义 Headers、请求体默认参数、客户端值优先规则和受保护请求头边界。
+  - **Cloudflare 部署**：补充多域名环境变量格式、生成配置和部署行为。
+
+  ### 升级说明
+
+  - **数据库迁移**：必须应用 **0028**；新列均可空，未配置 `rate_limit` 的存量用户与 API Key 保持不限流。
+  - **发布顺序**：备份数据库后先运行 v2.9.0 migrate，再滚动更新同版本 Proxy 与 Admin。回退旧版本时可保留新增列，无需立即删除。
+  - **限流边界**：RPM 计数默认保存在每个 Proxy 进程 / isolate 内存中；Node 单进程接近精确，多进程、多副本或 Cloudflare 多 isolate 场景属于软上限，重启会重置窗口状态。
+  - **配置兼容**：现有客户端 API 路径和鉴权方式保持不变，旧的单域名环境变量继续有效。用户级与 Key 级 RPM 不要求互相复制或满足大小关系。
+  - **路由参数**：`custom_params.headers` 仅用于上游请求头；其余 `custom_params` 是默认请求体参数。客户端显式参数优先，不能仅凭此配置实现强制封顶。
+  - **建议核验**：验证用户与 Key 两层 RPM、429 `Retry-After`、`GET /v1/me` 豁免、API Key 最近使用时间与分析数据、入口 Host 日志、自定义请求头，以及既有 Chat / Responses / Messages / Gemini / Images / Audio 路由。
+
+## 2.8.0
+
+### Minor Changes
+
+- [#137](https://github.com/OctaFuse/octafuse-gateway/pull/137) [`654d29a`](https://github.com/OctaFuse/octafuse-gateway/commit/654d29a3f4d43cd0d8911ec43572540e0296e774) Thanks [@dyc87112](https://github.com/dyc87112)! - OctaFuse Gateway v2.8.0 重点升级额度、协议转换和峰谷计价：周期额度与永久额度分开记账，可同时承载订阅与加购；协议适配统一由注册表描述；模型官方时段与路由倍率可组合计算，并通过模型列表接口向前台输出当前折扣。同时，本版本打通阿里云百炼千问 / 万相的 OpenAI Images 调用路径，并补齐 Node / Docker 环境的实时语音调试能力。
+
+  ### Proxy
+
+  - **永久额度扣费**：先扣周期额度，不够的差额扣永久额度；`budget_max` 非空时总剩余 = 周期剩余 + wallet 余额，总剩余 ≤ 0 才 403。周期上限为 0 但 wallet 仍有余额时可继续请求。请求日志增加 `charged_wallet_cost`。
+  - **DashScope 生图转换**：客户端仍打 `POST /v1/images/generations`；适配器 `dashscope-image-qwen` / `dashscope-image-wan` 改写为 DashScope `images.generations.multimodal`。千问 / 万相按张计费；千问 Pro 从响应 usage 反推 1K/2K 档。默认返回 URL，`response_format=b64_json` 时下载 OSS 再转 base64。
+  - **额度预检**：Images / Audio / Tools 预检与实扣使用同一套周期 + 永久总余额，不再把 `budget_max=0` 误判为超额。
+  - **模型列表价格信息**：`GET /v1/models` 与公开的 `GET /catalog/models` 按路由组返回 `discounts`，包含当前综合倍率、完整时段、业务时区和代表路由信息；`Discount.<group>:<factor>` 标签改为按当刻结果自动派生。
+  - **峰谷计价合成**：目录标准价先乘模型 `pricing_profile.schedule` 的官方时段倍率，再分别乘路由的用户计费 / 供应成本倍率。模型存在官方时段时，路由须沿用相同的时段形状，只配置本路由倍率，避免上下游峰谷窗口错位。
+
+  ### Admin
+
+  - **永久额度加额**：新增 `POST /api/admin/users/:id/wallet/credit`（`kind` + `external_ref` 幂等）。用户详情拆开展示周期额度与永久额度；加购不要再写入 `budget_max`。`PATCH` 仍可修正 wallet 绝对值。
+  - **DashScope 生图联调**：Playground / Simulator 对千问 / 万相转换路由使用 OpenAI Images JSON；调试台改写成 multimodal，模拟器走 Proxy `/v1/images/generations`。
+  - **路由适配器**：下拉项从统一注册表生成，直接标明客户端协议 / 端点到上游协议 / 端点的映射；选中后自动回填匹配字段，避免透传与转换混淆。
+  - **实时语音**：DashScope realtime ASR 默认改用浏览器麦克风；Docker Admin 运行层带上 `ws`，Node 入口为 `node-server.mjs`，调试台实时 ASR 不再 501。
+  - **模型预设**：新增 `hy4-preview`、`qwen3.8-flash`、`glm-5.3-flash`。目录导入不再写入 `model_tags`，标签由运营导入后自行维护。
+  - **模型 / 路由编辑**：模型页可维护官方时段倍率；路由页继承模型时段形状，并分别配置用户计费与供应成本倍率，同时预览每个时段的实际价格。
+
+  ### Core
+
+  - **统一协议适配注册表**：适配器 ID、客户端入口、上游协议 / 端点、模态、交互形态与计费口径集中到 `ADAPTER_REGISTRY`；配置层适配器与运行时 driver 分离，一个 driver 可服务多个稳定适配器 ID，便于后续扩展新模型协议。
+  - **定价与展示口径统一**：目录标准价、模型官方时段和路由时段使用同一套解析与命中逻辑；模型列表的 `discounts` 与真实计费共用倍率语义，但仅用于展示，不参与替代账单计算。
+  - **迁移 0027**：`users` 增加 `wallet_granted` / `wallet_spent`；`user_audit_logs.dedup_key` 唯一约束；`api_key_request_logs.charged_wallet_cost`。回填把 `budget_max − max(spent, base)` 的剩余迁入 wallet；`budget_max IS NULL` 与到期清零行（`max=0 AND period=none`）不抬回 `budget_base`；超支欠账钳到 0。
+
+  ### 文档
+
+  - **永久额度**：用户接口、Admin API、数据模型与请求生命周期写明先周期后永久、加额幂等与 0027 回填。
+  - **协议与计价**：新增适配器 / driver 架构说明，补齐模型官方时段、路由倍率以及 `/v1/models` / `/catalog/models` 的 `discounts` 字段语义。
+  - **DashScope 生图**：新增架构文档，标明 OpenAI Images 入口、转换适配器、按张计费与验收路径。
+  - **Docker Admin**：standalone 入口、`ws` 拷贝与实时 WebSocket 约束写入部署与构建说明。
+
+  ### 升级说明
+
+  - **数据库迁移**：必须应用 **0027**；D1、Postgres 与 MySQL 语义一致。上线前分别使用 `0027-user-wallet-credit-audit.d1.sql`（D1）或 `0027-user-wallet-credit-audit.sql`（Postgres / MySQL）只读核对。
+  - **发布顺序**：v2.8.0 的 Proxy / Admin 会直接读取 0027 新列，不能先连接未迁移的数据库。请在维护窗口内备份并暂停请求及 Admin 写入，执行 0027 后立即部署同版本 Proxy / Admin；禁止新旧版本混跑。确认服务正常后，门户再切到 `POST /api/admin/users/:id/wallet/credit`，不要再通过累加 `budget_max` 发放购买额度。
+  - **配置变更**：阿里云千问 / 万相生图需路由适配器选 `dashscope-image-qwen` 或 `dashscope-image-wan`，请求协议保持 `openai` / `images.generations`。Token Plan 须显式覆盖 `images.generations.multimodal`。模型配置了官方时段后，既有路由时段必须调整为相同的窗口与星期形状。
+  - **接口影响**：`GET /v1/models` 与 `GET /catalog/models` 增加 `discounts`，现有字段保持兼容。Chat / Messages / Gemini / Audio / Responses 入口不变。
+  - **兼容性影响**：额度判定改为周期额度与永久额度的总余额；周期用尽但 wallet 有余额的用户将从 403 变为可继续调用。已导入模型行不会被静态目录覆盖。
+  - **建议操作**：部署后核验 0027 回填、wallet 加额幂等与请求日志 `charged_wallet_cost`；检查模型 / 路由时段的实际价格预览和模型列表 `discounts`；再用 Playground / Simulator 冒烟 DashScope 生图、实时 ASR（麦克风）及既有 chat / messages / gemini / images / audio。
+
+## 2.7.0
+
+### Minor Changes
+
+- [#124](https://github.com/OctaFuse/octafuse-gateway/pull/124) [`7a7adfe`](https://github.com/OctaFuse/octafuse-gateway/commit/7a7adfe7cc76ec60d392b41efbda3145a07e9f86) Thanks [@dyc87112](https://github.com/dyc87112)! - OctaFuse Gateway v2.7.0 为用户增加按模型维护的计费倍率，新增 DashScope 同步多模态 ASR 入口，并让每日时段可按工作日 / 周末分别定价；管理后台同步整理用户、请求日志与供应商目录。
+
+  ### Proxy
+
+  - **用户计费倍率**：LLM / Images / Audio 在路由 Charged cost 之后再乘 `users.charged_cost_factors[models.id]`；只改最终 `charged_cost` 与预算累加，供应成本与目录标准价不变。智能体工具不应用。Images / Audio 预检与实扣使用同一最终金额。`pricing_audit` v4 可带 `user_charged_factor`（未命中为 `null`）。
+  - **DashScope 同步 ASR**：新增 `POST /v1/dashscope/services/aigc/multimodal-generation/generation`，按 `dashscope` + `audio.transcriptions.multimodal` 透传上游原生 JSON，并以 `usage.duration` / `usage.seconds` 按秒计费。
+  - **分时计价按星期**：时段窗口可写可选 `days`（ISO 1=周一 … 7=周日），未写则每天循环；跨午夜时 `days` 锚定窗口开始日。工作日 / 周末可配置不同倍率。
+
+  ### Admin
+
+  - **Charged cost factors**：`POST` / `PATCH /api/admin/users` 可写入 `{ "<models.id>": number }`；未知模型 ID、负数拒绝。用户详情页按模型 ID 增删行，随计划一并保存；仅改该字段时审计 `reason_code` 为 `admin_patch_charged_cost_factors`。
+  - **用户列表**：额度改为已消费 / 上限进度条，并展示周期重置、Keys 激活数 / 总数与用户计费倍率摘要；筛选与排序扫描效率同步整理。
+  - **请求日志**：入站 / 上游协议路径、供应商与路由组并列展示，并按模型类型与操作打功能标签。
+  - **调试台 / 模拟器**：请求体预览更完整；补齐 DashScope 同步 ASR 与 realtime 操作模板校验。
+  - **供应商导入**：新增超算互联网 SCNet 模板（OpenAI chat + Anthropic Messages）。
+  - **模型预设**：阿里云百炼目录收录 `qwen-image-3.0` / `qwen-image-3.0-pro` / `wan2.7-image` / `wan2.7-image-pro`（按张计费）。上游仍是 DashScope 原生接口，导入后不能直接打 `/v1/images/generations`。
+  - **路由编辑**：每日时段编辑支持按星期选择，并展示工作日 / 周末提示。
+
+  ### Core
+
+  - **迁移 0026**：`users` 增加 `charged_cost_factors`（D1 / Postgres / MySQL）。鉴权 JOIN 带上该列，请求路径不再额外查用户。
+  - **分时计价**：`pricing-schedule` 解析、校验与命中逻辑支持可选 `days`，并写入 `pricing_audit.schedule.local_weekday`。
+
+  ### 文档
+
+  - **用户计费倍率**：用户接口、Admin API 与流式计费说明补齐倍率相乘、预检与 `pricing_audit` v4。
+  - **DashScope 音频**：同步多模态 ASR 入口、adapter 与 Playground / Simulator 联调路径写入架构与用户接口。
+  - **分时计价**：时段 `days` 与业务时区下的星期命中规则写入时间与计费文档。
+  - **文生图目录**：收录阿里云百炼当前代图片模型，并标明尚未接入 OpenAI Images 驱动。
+
+  ### 升级说明
+
+  - **数据库迁移**：必须应用 **0026**；三种数据库语义一致。未配置 `charged_cost_factors` 的用户计费行为与升级前一致。
+  - **发布顺序**：拉取同版本的 proxy、admin 和 migrate 镜像；按现有发布流程执行一次 migrate Job，然后滚动重启 proxy 和 admin。
+  - **配置变更**：需要按用户打折或加价时，在管理后台用户详情或 Admin API 写入对应目录模型 ID 的倍率。分时窗口若要区分工作日 / 周末，为窗口补 `days`；省略则仍每天生效。
+  - **兼容性影响**：现有 Chat、Messages、Gemini、Images、Audio 和 Responses 接口保持不变。DashScope 同步 ASR 为增量入口。未写 `days` 的旧时段配置继续每天循环。阿里云图片预设仅进目录，不会自动打通 `/v1/images/generations`。
+  - **建议操作**：部署后核验迁移 0026、用户计费倍率保存与请求日志中的 `user_charged_factor`；用 Playground / Simulator 冒烟 DashScope 同步 ASR 与既有 chat / messages / gemini / images / audio；如需新图片目录，再导入阿里云预设，但不要期待 OpenAI Images 入口可用。
+
 ## 2.6.0
 
 ### Minor Changes

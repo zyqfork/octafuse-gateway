@@ -1,6 +1,8 @@
 'use client';
 
 import { useCallback, useState } from 'react';
+import { useTranslations } from 'next-intl';
+import { useFeedback } from '@/components/feedback';
 import {
 	isAudioModel,
 	isImageGenerationModel,
@@ -15,8 +17,10 @@ import {
 	draftRowsHaveImageTokenPrices,
 	draftRowsLookLikeImageOnly,
 	profileJsonToAudioDraftState,
+	profileJsonToCatalogScheduleDraft,
 	profileJsonToDraftState,
 	type AudioPricingDraftState,
+	type CatalogScheduleFormWindow,
 	type ImageBillingModeDraft,
 	type ImagePerImageDraft,
 	type ImagePricingDraftState,
@@ -60,12 +64,18 @@ function createInitialImagePricingDraft(mode: ImageBillingModeDraft = 'token'): 
  */
 export function useModelEditModal(options?: Options) {
 	const onChanged = options?.onChanged;
+	const tModal = useTranslations('models.modal');
+	const tCommon = useTranslations('common');
+	const { notify, confirm } = useFeedback();
 	const { currency: billingCurrency } = useBillingCurrency();
 	const [showModal, setShowModal] = useState(false);
 	const [editingModel, setEditingModel] = useState<ModelListItem | null>(null);
 	const [formData, setFormData] = useState<ModelFormData>(EMPTY_MODEL_FORM);
 	const [formKind, setFormKind] = useState<ModelFormKind>('llm');
 	const [pricingTierRows, setPricingTierRows] = useState<PricingTierDraftRow[]>([]);
+	const [catalogScheduleWindows, setCatalogScheduleWindows] = useState<CatalogScheduleFormWindow[]>(
+		[]
+	);
 	const [imageBillingMode, setImageBillingMode] = useState<ImageBillingModeDraft>('token');
 	const [imagePerImageDraft, setImagePerImageDraft] = useState<ImagePerImageDraft>(
 		createDefaultImagePerImageDraft()
@@ -116,6 +126,7 @@ export function useModelEditModal(options?: Options) {
 			} else {
 				applyImagePricingDraft(profileJsonToDraftState(model.pricing_profile));
 			}
+			setCatalogScheduleWindows(profileJsonToCatalogScheduleDraft(model.pricing_profile));
 		},
 		[applyImagePricingDraft]
 	);
@@ -147,6 +158,7 @@ export function useModelEditModal(options?: Options) {
 				setImageBillingMode('token');
 				setImagePerImageDraft(createDefaultImagePerImageDraft());
 			}
+			setCatalogScheduleWindows([]);
 			setShowModal(true);
 			setSaveError('');
 		},
@@ -240,6 +252,7 @@ export function useModelEditModal(options?: Options) {
 			fillFormFromModel(model);
 			try {
 				const fullModel = await fetchModelDetail(model.id);
+				setEditingModel(fullModel);
 				fillFormFromModel(fullModel);
 			} catch (error) {
 				console.error('Fetch model details error:', error);
@@ -261,21 +274,21 @@ export function useModelEditModal(options?: Options) {
 				setShowModal(true);
 			} catch (error) {
 				console.error('Fetch model details error:', error);
-				alert('Failed to load model');
+				notify('error', tCommon('failedToLoadModels'));
 			}
 		},
-		[fillFormFromModel]
+		[fillFormFromModel, notify, tCommon]
 	);
 
 	const handleDelete = useCallback(
 		async (id: string) => {
-			if (
-				!confirm(
-					'Are you sure you want to delete this model? This will also delete all associated routes.'
-				)
-			) {
-				return;
-			}
+			const ok = await confirm({
+				title: tModal('deleteModel'),
+				message: tModal('confirmDelete'),
+				confirmLabel: tCommon('delete'),
+				danger: true,
+			});
+			if (!ok) return;
 
 			setIsDeleting(true);
 			try {
@@ -285,16 +298,16 @@ export function useModelEditModal(options?: Options) {
 					setEditingModel(null);
 					await onChanged?.();
 				} else {
-					alert(result.message || 'Delete failed');
+					notify('error', result.message || tCommon('failed'));
 				}
 			} catch (error) {
 				console.error('Delete error:', error);
-				alert('Delete failed');
+				notify('error', tCommon('failed'));
 			} finally {
 				setIsDeleting(false);
 			}
 		},
-		[onChanged]
+		[confirm, notify, onChanged, tCommon, tModal]
 	);
 
 	const handleAddTag = useCallback(() => {
@@ -381,7 +394,8 @@ export function useModelEditModal(options?: Options) {
 				pricingTierRows,
 				editingModel?.id ?? null,
 				imageDraft,
-				audioDraft
+				audioDraft,
+				catalogScheduleWindows
 			);
 			if (result.success) {
 				setShowModal(false);
@@ -397,7 +411,8 @@ export function useModelEditModal(options?: Options) {
 		}
 	}, [
 		audioPricingDraft,
-		editingModel?.id,
+		catalogScheduleWindows,
+		editingModel,
 		formData,
 		formKind,
 		imageBillingMode,
@@ -420,6 +435,8 @@ export function useModelEditModal(options?: Options) {
 		formKind,
 		pricingTierRows,
 		setPricingTierRows,
+		catalogScheduleWindows,
+		setCatalogScheduleWindows,
 		imageBillingMode,
 		setImageBillingMode: handleImageBillingModeChange,
 		imagePerImageDraft,

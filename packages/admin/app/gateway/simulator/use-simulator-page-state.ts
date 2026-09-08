@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslations } from 'next-intl';
+import { useFeedback } from '@/components/feedback';
 import { flushSync } from 'react-dom';
 import { readApiJson } from '@/lib/api-json';
 import { isAudioRouteModel, validateAudioTranscriptionFile } from '@/lib/audio-transcriptions';
@@ -28,6 +29,8 @@ import {
 } from '@/lib/simulator/endpoint';
 import {
 	dashScopeRealtimeAudioContentType,
+	defaultAudioInputModeForDashScopeOperation,
+	isDashScopeRealtimeOperation,
 	openDashScopeRealtimeClient,
 	stopDashScopeRealtimeClient,
 	type DashScopeRealtimeOperation,
@@ -65,7 +68,7 @@ import {
 	buildModelRoutingString,
 	filterMatchingActiveRoutes,
 	isBodyDirty,
-	listDashScopeRealtimeOperations,
+	listDashScopeAudioClientOperations,
 	listGatewayTools,
 	listSupportedClientSurfaces,
 	redactHeaders,
@@ -81,6 +84,7 @@ function resolveModelKind(m: AdminModelRow | null | undefined): ModelKindFilter 
 export function useSimulatorPageState() {
 	const t = useTranslations('simulator');
 	const tCommon = useTranslations('common');
+	const { confirm } = useFeedback();
 
 	const [proxyBaseUrl, setProxyBaseUrl] = useState('');
 	const [protocol, setProtocolState] = useState<SimulatorProtocol>('openai');
@@ -101,7 +105,7 @@ export function useSimulatorPageState() {
 	const [filterModel, setFilterModel] = useState('');
 	const [selectedModelId, setSelectedModelId] = useState('');
 	const [selectedToolId, setSelectedToolId] = useState<GatewayToolId>(GATEWAY_TOOL_IDS[0] ?? 'web-search');
-	const [dashScopeRealtimeOperation, setDashScopeRealtimeOperation] = useState<DashScopeRealtimeOperation | ''>('');
+	const [dashScopeRealtimeOperation, setDashScopeRealtimeOperation] = useState<string>('');
 	const [routeGroup, setRouteGroup] = useState('');
 	const isToolKind = filterKind === 'tool';
 
@@ -249,7 +253,7 @@ export function useSimulatorPageState() {
 	const realtimeOperationOptions = useMemo(
 		() =>
 			selectedModelId && selectedAudioOperation
-				? listDashScopeRealtimeOperations(routes, selectedModelId, routeGroup, selectedAudioOperation)
+				? listDashScopeAudioClientOperations(routes, selectedModelId, routeGroup, selectedAudioOperation)
 				: [],
 		[routes, selectedModelId, routeGroup, selectedAudioOperation],
 	);
@@ -265,10 +269,10 @@ export function useSimulatorPageState() {
 		selectedDashScopeRealtimeOperation?.startsWith('audio.transcriptions.realtime.') ?? false;
 	const setDashScopeRealtimeOperationForSelection = useCallback(
 		(operation: string) => {
-			if (!realtimeOperationOptions.includes(operation as DashScopeRealtimeOperation)) {
+			if (!realtimeOperationOptions.includes(operation)) {
 				return;
 			}
-			setDashScopeRealtimeOperation(operation as DashScopeRealtimeOperation);
+			setDashScopeRealtimeOperation(operation);
 			if (protocol === 'dashscope' && selectedAudioOperation) {
 				const providerModelName = filterMatchingActiveRoutes(
 					routes,
@@ -293,6 +297,7 @@ export function useSimulatorPageState() {
 		},
 		[protocol, selectedAudioOperation, realtimeOperationOptions, routes, selectedModelId, routeGroup],
 	);
+	const selectedUsesDashScopeHttpAsr = selectedDashScopeRealtimeOperation === 'audio.transcriptions.multimodal';
 	/** DashScope 实时 ASR 的麦克风模式不需要上传文件；发送和按钮校验共用这个判定。 */
 	const usesDashScopeMicrophone = selectedCanUseMicrophone && audioInputMode === 'microphone';
 
@@ -343,7 +348,15 @@ export function useSimulatorPageState() {
 			}
 			if (matchingRoutes.length === 0) return 'route';
 			if (selectedAudioOperation === 'transcriptions' && (protocol === 'openai' || protocol === 'dashscope')) {
-				if (!usesDashScopeMicrophone) {
+				const fileUrl = (() => {
+					try {
+						const parsed = JSON.parse(bodyText) as { file_url?: unknown };
+						return typeof parsed.file_url === 'string' ? parsed.file_url.trim() : '';
+					} catch {
+						return '';
+					}
+				})();
+				if (!usesDashScopeMicrophone && !selectedUsesDashScopeHttpAsr && !fileUrl) {
 					const validated = validateAudioTranscriptionFile(audioFile);
 					if (!validated.ok) return 'audioFile';
 				}
@@ -365,6 +378,8 @@ export function useSimulatorPageState() {
 		selectedModelIsAudio,
 		selectedAudioOperation,
 		usesDashScopeMicrophone,
+		selectedUsesDashScopeHttpAsr,
+		bodyText,
 		protocol,
 		imageOperation,
 		editFiles,
@@ -461,6 +476,9 @@ export function useSimulatorPageState() {
 				apiKey: revealedSk,
 				audioOperation: audioOperation ?? undefined,
 				audioFile: audioOperation === 'transcriptions' ? audioFile : undefined,
+				dashscopeRequestOperation: selectedUsesDashScopeHttpAsr
+					? 'audio.transcriptions.multimodal'
+					: undefined,
 				imageOperation: useImages ? imageOperation : undefined,
 				editImages: useImages && imageOperation === 'edits' ? editFiles : undefined,
 			});
@@ -736,7 +754,7 @@ export function useSimulatorPageState() {
 			setAudioPreviewUrl(null);
 			setEditFiles([]);
 			setAudioFile(null);
-			setAudioInputMode('file');
+			setAudioInputMode(defaultAudioInputModeForDashScopeOperation(selectedDashScopeRealtimeOperation));
 			prevSelectedSpecialKindRef.current = 'audio';
 			return;
 		}
@@ -950,7 +968,7 @@ export function useSimulatorPageState() {
 	);
 
 	const requestProtocolChange = useCallback(
-		(next: SimulatorProtocol) => {
+		async (next: SimulatorProtocol) => {
 			if (next === protocol) return;
 			if (selectedModelIsAudio && next !== 'openai' && next !== 'dashscope') {
 				setInfoHint(t('protocolLockedAudio'));
@@ -973,7 +991,7 @@ export function useSimulatorPageState() {
 					openaiLlmOperation,
 				)
 			) {
-				const ok = window.confirm(t('protocolSwitchConfirm'));
+				const ok = await confirm({ title: t('protocolSwitchConfirm') });
 				if (!ok) return;
 			}
 			applyProtocolTemplate(next);
@@ -990,11 +1008,12 @@ export function useSimulatorPageState() {
 			selectedDashScopeTtsProviderModelName,
 			imageOperation,
 			openaiLlmOperation,
+			confirm,
 		],
 	);
 
 	const requestOpenaiLlmOperationChange = useCallback(
-		(next: OpenaiLlmOperation) => {
+		async (next: OpenaiLlmOperation) => {
 			if (next === openaiLlmOperation) return;
 			if (
 				isBodyDirty(
@@ -1009,7 +1028,7 @@ export function useSimulatorPageState() {
 					openaiLlmOperation,
 				)
 			) {
-				const ok = window.confirm(t('openaiOperationSwitchConfirm'));
+				const ok = await confirm({ title: t('openaiOperationSwitchConfirm') });
 				if (!ok) return;
 			}
 			setOpenaiLlmOperationState(next);
@@ -1038,6 +1057,7 @@ export function useSimulatorPageState() {
 			selectedDashScopeRealtimeOperation,
 			selectedDashScopeTtsProviderModelName,
 			t,
+			confirm,
 		],
 	);
 
@@ -1138,7 +1158,8 @@ export function useSimulatorPageState() {
 			!isToolKind && (protocol === 'openai' || protocol === 'dashscope') ? selectedAudioOperation : null;
 		const useImages = !isToolKind && selectedModelIsImage && !selectedModelIsAudio && protocol === 'openai';
 		if (audioOperation === 'transcriptions') {
-			if (!usesDashScopeMicrophone) {
+			const fileUrl = typeof bodyObj.file_url === 'string' ? bodyObj.file_url.trim() : '';
+			if (!usesDashScopeMicrophone && !selectedUsesDashScopeHttpAsr && !fileUrl) {
 				const validated = validateAudioTranscriptionFile(audioFile);
 				if (!validated.ok) {
 					setBodyError(validated.error);
@@ -1147,10 +1168,11 @@ export function useSimulatorPageState() {
 			}
 		}
 
-		const isDashScopeRealtime = protocol === 'dashscope' && audioOperation != null;
+		const isDashScopeRealtime =
+			protocol === 'dashscope' && audioOperation != null && !selectedUsesDashScopeHttpAsr;
 		if (isDashScopeRealtime) {
 			const operation = selectedDashScopeRealtimeOperation;
-			if (!operation) {
+			if (!operation || !isDashScopeRealtimeOperation(operation)) {
 				setBodyError(t('readyNeedModel'));
 				return;
 			}
@@ -1255,6 +1277,9 @@ export function useSimulatorPageState() {
 				apiKey: revealedSk,
 				audioOperation: audioOperation ?? undefined,
 				audioFile: audioOperation === 'transcriptions' ? audioFile : undefined,
+				dashscopeRequestOperation: selectedUsesDashScopeHttpAsr
+					? 'audio.transcriptions.multimodal'
+					: undefined,
 				imageOperation: useImages ? imageOperation : undefined,
 				editImages: useImages && imageOperation === 'edits' ? editFiles : undefined,
 			});

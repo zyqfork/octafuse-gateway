@@ -9,6 +9,7 @@ import {
 	isTextLlmModel,
 	parseModelModalitiesJson,
 	parsePricingProfile,
+	type DisplayDiscountGroup,
 } from '@octafuse/core';
 import { Hono } from 'hono';
 import type { Env } from '../../app';
@@ -19,9 +20,13 @@ import {
 	parseModelsKindQuery,
 	parseModelsRouteGroupsQuery,
 	parseRouteGroupsJson,
-	parseTags,
 } from '../../lib/model-list-parse';
-import { listPublicModelsWithRoutes } from '../../services/public-models';
+import { collectLlmInboundSurfaces, type LlmInboundSurface } from '../../services/inbound-surfaces';
+import {
+	buildModelDisplayDiscounts,
+	loadPublicModelListContext,
+	tagsWithDerivedDiscounts,
+} from '../../services/public-models';
 
 type ModelsEnv = Env & { Variables: { apiKey: import('../../middleware/auth').ApiKeyContext } };
 
@@ -37,7 +42,8 @@ export {
 
 /**
  * `/v1/models` 中扩展字段：定价、能力与展示用元数据。
- * 说明：`supports_prompt_cache`、`thinking_config` 等由 Agent 本地维护，不由网关返回。
+ * 说明：`supports_prompt_cache`、`thinking_config` 等由客户端维护，不由网关返回。
+ * `inbound` 是请求入口（protocol + operation），不是上游协议；选哪条由客户端决定。
  */
 interface ModelInfoResponse {
 	display_name: string | null;
@@ -63,7 +69,14 @@ interface ModelInfoResponse {
 	output_modalities: string[] | null;
 	/** Model release date `YYYY-MM-DD`. */
 	released_at: string | null;
+	/**
+	 * 按 route_group 派生的前台折扣（官方时段 × 代表路由 charged 有效倍率）。
+	 * `Discount:*` tags 由此自动注入，不再手填。
+	 */
+	discounts?: Record<string, DisplayDiscountGroup>;
 	metadata?: Record<string, unknown>;
+	/** LLM 请求入口（Chat / Responses / Messages / Gemini generate），不含图/音频。 */
+	inbound: LlmInboundSurface[];
 }
 
 interface ModelResponse {
@@ -99,7 +112,7 @@ function displayCompatPricesFromProfile(pricingProfile: string | null): {
  */
 modelsRoutes.get('/', async (c) => {
 	const repos = c.get('repositories');
-	const models = await listPublicModelsWithRoutes(repos);
+	const { models, routesByModel, timezone } = await loadPublicModelListContext(repos);
 	const allowedRouteGroups = parseModelsRouteGroupsQuery(c.req.query('route_groups'));
 	const kind = parseModelsKindQuery(c.req.query('kind'));
 
@@ -127,6 +140,13 @@ modelsRoutes.get('/', async (c) => {
 		if (routeGroups.length === 0) {
 			continue;
 		}
+		const discounts = buildModelDisplayDiscounts({
+			model: m,
+			routes: routesByModel.get(m.id) ?? [],
+			timezone,
+			allowedRouteGroups: routeGroups,
+		});
+		const inbound = collectLlmInboundSurfaces(routesByModel.get(m.id) ?? [], routeGroups);
 		list.push({
 			id: m.id,
 			object: 'model',
@@ -134,8 +154,9 @@ modelsRoutes.get('/', async (c) => {
 			model_info: {
 				display_name: m.display_name,
 				vendor: m.vendor,
-				tags: parseTags(m.tags),
+				tags: tagsWithDerivedDiscounts(m, discounts),
 				route_groups: routeGroups,
+				discounts,
 				context_window: m.context_window,
 				max_tokens: m.max_tokens,
 				pricing_profile: m.pricing_profile,
@@ -146,6 +167,7 @@ modelsRoutes.get('/', async (c) => {
 				output_modalities: parseModelModalitiesJson(m.output_modalities),
 				released_at: m.released_at ?? null,
 				metadata: parseMetadata(m.metadata),
+				inbound,
 			},
 		});
 	}

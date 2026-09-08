@@ -105,6 +105,24 @@ describe("buildSimulatorRequest openai", () => {
 		assert.equal(result.headers["Content-Type"], undefined);
 		assert.equal(result.headers.Authorization, "Bearer sk-test");
 		assert.match(result.multipartSummary ?? "", /ref\.png/);
+		assert.equal(result.formData?.getAll("image").length, 1);
+		assert.equal(result.formData?.getAll("image[]").length, 0);
+	});
+
+	it("uses image[] for multiple images/edits files", () => {
+		const a = new File([Uint8Array.from([137, 80, 78, 71])], "a.png", { type: "image/png" });
+		const b = new File([Uint8Array.from([137, 80, 78, 71])], "b.png", { type: "image/png" });
+		const result = buildSimulatorRequest({
+			baseUrl: "https://gateway.example.com",
+			protocol: "openai",
+			modelForRouting: "gpt-image-2",
+			body: { prompt: "fuse these" },
+			apiKey: "sk-test",
+			imageOperation: "edits",
+			editImages: [a, b],
+		});
+		assert.equal(result.formData?.getAll("image").length, 0);
+		assert.equal(result.formData?.getAll("image[]").length, 2);
 	});
 
 	it("previews images/edits URL even when no reference files yet", () => {
@@ -158,6 +176,37 @@ describe("buildSimulatorRequest openai", () => {
 			"https://gateway.example.com/v1/audio/transcriptions"
 		);
 		assert.match(result.multipartSummary ?? "", /none selected/);
+	});
+
+	it("includes file_url in the OpenAI transcriptions multipart preview", () => {
+		const result = buildSimulatorRequest({
+			baseUrl: "https://gateway.example.com",
+			protocol: "openai",
+			modelForRouting: "qwen-audio-3.0-asr-flash-filetrans",
+			body: { file_url: "https://audio.example/sample.wav", language: "zh" },
+			apiKey: "sk-test",
+			audioOperation: "transcriptions",
+			audioFile: null,
+		});
+		assert.match(result.multipartSummary ?? "", /file_url: https:\/\/audio.example\/sample.wav/);
+	});
+
+	it("builds DashScope multimodal HTTP transcriptions", () => {
+		const result = buildSimulatorRequest({
+			baseUrl: "https://gateway.example.com",
+			kind: "audio",
+			protocol: "dashscope",
+			modelForRouting: "qwen-audio-3.0-asr-flash",
+			body: { input: { messages: [] }, parameters: { format: "wav" } },
+			apiKey: "sk-test",
+			audioOperation: "transcriptions",
+			dashscopeRequestOperation: "audio.transcriptions.multimodal",
+		});
+		assert.equal(
+			result.url,
+			"https://gateway.example.com/v1/dashscope/services/aigc/multimodal-generation/generation"
+		);
+		assert.equal(JSON.parse(result.bodyText).model, "qwen-audio-3.0-asr-flash");
 	});
 
 	it("builds JSON for audio/speech", () => {

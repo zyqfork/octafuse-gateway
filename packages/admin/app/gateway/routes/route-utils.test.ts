@@ -2,9 +2,15 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { GatewayModel, GatewayModelRoute, GatewayProvider } from '@/lib/types';
 import {
+	adapterOptionMappingSuffix,
+	applyDashScopeAsrRoutePreset,
+	applyDashScopeImageRoutePreset,
 	applyDashScopeTtsRoutePreset,
+	alignRouteScheduleWindowsToCatalog,
+	composeCustomParamsJson,
 	buildFormDataFromRoute,
 	buildRouteSavePayload,
+	catalogScheduleWindowsFromModel,
 	formatRoutePriceOverridePreview,
 	buildRouteSurfaceCatalog,
 	compatibleAdaptersForRoute,
@@ -17,6 +23,7 @@ import {
 	resolveRouteScheduleDisplay,
 	scheduleWindowShapeKey,
 	hasBasePricingInversion,
+	parseCustomParamsForm,
 	requestOperationsForModel,
 	requestLogProtocolPath,
 	requestSurfacePath,
@@ -26,6 +33,8 @@ import {
 	upstreamOperationsForProviderModel,
 	type RouteModelGroup,
 } from './route-utils';
+import { getAdapterByOptionKey } from '@octafuse/core/adapters/registry';
+import { listStaticProviderImportPresets } from '@/lib/provider-import-preset';
 import { EMPTY_ROUTE_FORM } from './types';
 
 function model(overrides: Partial<GatewayModel> = {}): GatewayModel {
@@ -81,6 +90,10 @@ describe('request surface path', () => {
 		assert.equal(requestSurfacePath('dashscope', 'audio.speech', 'cosyvoice-v2'), '/v1/audio/speech');
 		assert.equal(requestSurfacePath('dashscope', 'audio.speech.multimodal'), '/v1/audio/speech');
 		assert.equal(requestSurfacePath('dashscope', 'audio.transcriptions'), '/v1/audio/transcriptions');
+		assert.equal(
+			requestSurfacePath('dashscope', 'audio.transcriptions.multimodal'),
+			'/v1/dashscope/services/aigc/multimodal-generation/generation',
+		);
 	});
 
 	it('compacts Gemini endpoints for request-log rows', () => {
@@ -130,6 +143,84 @@ describe('route form capability filters', () => {
 		);
 	});
 
+	it('builds DashScope ASR presets for convert, passthrough and filetrans', () => {
+		const convert = applyDashScopeAsrRoutePreset(EMPTY_ROUTE_FORM, 'flash-convert');
+		assert.deepEqual(
+			{
+				requestProtocol: convert.request_protocol,
+				requestOperation: convert.request_operation,
+				upstreamProtocol: convert.upstream_protocol,
+				upstreamOperation: convert.upstream_operation,
+				adapter: convert.adapter,
+			},
+			{
+				requestProtocol: 'openai',
+				requestOperation: 'audio.transcriptions',
+				upstreamProtocol: 'dashscope',
+				upstreamOperation: 'audio.transcriptions.multimodal',
+				adapter: 'dashscope-asr-qwen-audio-file',
+			},
+		);
+		const passthrough = applyDashScopeAsrRoutePreset(EMPTY_ROUTE_FORM, 'flash-passthrough');
+		assert.equal(passthrough.request_protocol, 'dashscope');
+		assert.equal(passthrough.request_operation, 'audio.transcriptions.multimodal');
+		assert.equal(passthrough.adapter, 'passthrough');
+		const filetrans = applyDashScopeAsrRoutePreset(EMPTY_ROUTE_FORM, 'filetrans');
+		assert.equal(filetrans.upstream_operation, 'audio.transcriptions.async');
+		assert.equal(filetrans.adapter, 'dashscope-asr-file-async');
+	});
+
+	it('wires qwen-audio-3.0-asr-flash on Token Plan to convert and passthrough, not filetrans', () => {
+		const qwenTokenPlan = listStaticProviderImportPresets().find(
+			(row) => row.name === 'Qwen AI Platform (Token Plan)',
+		);
+		assert.ok(qwenTokenPlan);
+		const asr = model({
+			id: 'qwen-audio-3.0-asr-flash',
+			pricing_profile: JSON.stringify({
+				audio_billing_mode: 'per_second',
+				audio: { price_per_second: 0.0001 },
+			}),
+		});
+		assert.deepEqual(
+			upstreamOperationsForProviderModel(
+				provider(qwenTokenPlan.endpoints),
+				asr,
+				'dashscope',
+				'qwen-audio-3.0-asr-flash',
+			),
+			['audio.transcriptions.multimodal', 'audio.transcriptions.realtime.inference'],
+		);
+		assert.equal(
+			applyDashScopeAsrRoutePreset(EMPTY_ROUTE_FORM, 'flash-convert').adapter,
+			'dashscope-asr-qwen-audio-file',
+		);
+		assert.equal(applyDashScopeAsrRoutePreset(EMPTY_ROUTE_FORM, 'flash-passthrough').adapter, 'passthrough');
+	});
+
+	it('builds DashScope image presets for Qwen and Wan families', () => {
+		const qwen = applyDashScopeImageRoutePreset(EMPTY_ROUTE_FORM, 'qwen');
+		assert.deepEqual(
+			{
+				requestProtocol: qwen.request_protocol,
+				requestOperation: qwen.request_operation,
+				upstreamProtocol: qwen.upstream_protocol,
+				upstreamOperation: qwen.upstream_operation,
+				adapter: qwen.adapter,
+			},
+			{
+				requestProtocol: 'openai',
+				requestOperation: 'images.generations',
+				upstreamProtocol: 'dashscope',
+				upstreamOperation: 'images.generations.multimodal',
+				adapter: 'dashscope-image-qwen',
+			},
+		);
+		const wan = applyDashScopeImageRoutePreset(EMPTY_ROUTE_FORM, 'wan');
+		assert.equal(wan.adapter, 'dashscope-image-wan');
+		assert.equal(wan.upstream_operation, 'images.generations.multimodal');
+	});
+
 	it('limits public operations by model modality', () => {
 		assert.deepEqual(requestOperationsForModel(model(), 'openai'), ['chat', 'responses']);
 		assert.deepEqual(
@@ -166,7 +257,7 @@ describe('route form capability filters', () => {
 				}),
 				'dashscope',
 			),
-			['audio.transcriptions.realtime.inference', 'audio.transcriptions.realtime.session'],
+			['audio.transcriptions.multimodal', 'audio.transcriptions.realtime.inference', 'audio.transcriptions.realtime.session'],
 		);
 		assert.deepEqual(
 			requestOperationsForModel(
@@ -179,7 +270,7 @@ describe('route form capability filters', () => {
 				'dashscope',
 				'fun-asr-realtime',
 			),
-			['audio.transcriptions.realtime.inference'],
+			['audio.transcriptions.multimodal', 'audio.transcriptions.realtime.inference'],
 		);
 		assert.deepEqual(
 			requestOperationsForModel(
@@ -192,7 +283,7 @@ describe('route form capability filters', () => {
 				'dashscope',
 				'qwen3-asr-flash-realtime',
 			),
-			['audio.transcriptions.realtime.session'],
+			['audio.transcriptions.multimodal', 'audio.transcriptions.realtime.session'],
 		);
 		assert.deepEqual(
 			requestOperationsForModel(
@@ -273,13 +364,14 @@ describe('route form capability filters', () => {
 			}),
 		});
 		assert.deepEqual(upstreamOperationsForProviderModel(dashScope, asr, 'dashscope'), [
+			'audio.transcriptions.multimodal',
 			'audio.transcriptions.async',
 			'audio.transcriptions.realtime.inference',
 			'audio.transcriptions.realtime.session',
 		]);
 		assert.deepEqual(
 			upstreamOperationsForProviderModel(dashScope, asr, 'dashscope', 'fun-asr-realtime'),
-			['audio.transcriptions.async', 'audio.transcriptions.realtime.inference'],
+			['audio.transcriptions.multimodal', 'audio.transcriptions.async', 'audio.transcriptions.realtime.inference'],
 		);
 
 		const tts = model({
@@ -292,6 +384,14 @@ describe('route form capability filters', () => {
 			'audio.speech',
 			'audio.speech.realtime.inference',
 		]);
+
+		const image = model({
+			input_modalities: '["text","image"]',
+			output_modalities: '["image"]',
+		});
+		assert.deepEqual(upstreamOperationsForProviderModel(dashScope, image, 'dashscope'), [
+			'images.generations.multimodal',
+		]);
 	});
 
 	it('only offers adapters that exactly match the selected topology', () => {
@@ -302,7 +402,7 @@ describe('route form capability filters', () => {
 				upstream_protocol: 'dashscope',
 				upstream_operation: 'audio.transcriptions.multimodal',
 			}),
-			['dashscope-asr-qwen-file', 'dashscope-asr-fun-file'],
+			['dashscope-asr-qwen-file', 'dashscope-asr-qwen-audio-file', 'dashscope-asr-fun-file'],
 		);
 		assert.deepEqual(
 			compatibleAdaptersForRoute({
@@ -321,6 +421,42 @@ describe('route form capability filters', () => {
 				upstream_operation: 'audio.transcriptions.async',
 			}),
 			['dashscope-asr-file-async'],
+		);
+		assert.deepEqual(
+			compatibleAdaptersForRoute({
+				request_protocol: 'openai',
+				request_operation: 'images.generations',
+				upstream_protocol: 'dashscope',
+				upstream_operation: 'images.generations.multimodal',
+			}),
+			['dashscope-image-qwen', 'dashscope-image-wan'],
+		);
+	});
+
+	it('builds dropdown mapping suffixes from the registry', () => {
+		const passthrough = getAdapterByOptionKey('passthrough:openai:audio.transcriptions');
+		assert.ok(passthrough);
+		assert.equal(adapterOptionMappingSuffix(passthrough), ' · openai/audio.transcriptions');
+
+		const syncAsr = getAdapterByOptionKey('dashscope-asr-qwen-audio-file');
+		assert.ok(syncAsr);
+		assert.equal(
+			adapterOptionMappingSuffix(syncAsr),
+			' · openai/audio.transcriptions → dashscope/audio.transcriptions.multimodal',
+		);
+
+		const asyncAsr = getAdapterByOptionKey('dashscope-asr-file-async');
+		assert.ok(asyncAsr);
+		assert.equal(
+			adapterOptionMappingSuffix(asyncAsr),
+			' · openai/audio.transcriptions → dashscope/audio.transcriptions.async',
+		);
+
+		const tts = getAdapterByOptionKey('dashscope-tts-qwen');
+		assert.ok(tts);
+		assert.equal(
+			adapterOptionMappingSuffix(tts),
+			' · openai/audio.speech → dashscope/audio.speech.multimodal',
 		);
 	});
 });
@@ -640,8 +776,8 @@ describe('buildFormDataFromRoute / buildRouteSavePayload schedule', () => {
 			[],
 		);
 		assert.deepEqual(form.schedule_windows, [
-			{ start: '09:00', end: '12:00', charged_factor: '0.6', metered_factor: '2' },
-			{ start: '12:00', end: '18:00', charged_factor: '1.2', metered_factor: '2' },
+			{ start: '09:00', end: '12:00', charged_factor: '0.6', metered_factor: '2', days: [] },
+			{ start: '12:00', end: '18:00', charged_factor: '1.2', metered_factor: '2', days: [] },
 		]);
 	});
 
@@ -682,7 +818,7 @@ describe('buildFormDataFromRoute / buildRouteSavePayload schedule', () => {
 				charged_factor: '1',
 				metered_factor: '1',
 				schedule_windows: [
-					{ start: '09:00', end: '12:00', charged_factor: '2', metered_factor: '2' },
+					{ start: '09:00', end: '12:00', charged_factor: '2', metered_factor: '2', days: [] },
 				],
 			},
 			null,
@@ -710,8 +846,8 @@ describe('buildFormDataFromRoute / buildRouteSavePayload schedule', () => {
 			charged_factor: '1',
 			metered_factor: '1',
 			schedule_windows: [
-				{ start: '09:00', end: '12:00', charged_factor: '2', metered_factor: '2' },
-				{ start: '14:00', end: '18:00', charged_factor: '2', metered_factor: '2' },
+				{ start: '09:00', end: '12:00', charged_factor: '2', metered_factor: '2', days: [] },
+				{ start: '14:00', end: '18:00', charged_factor: '2', metered_factor: '2', days: [] },
 			],
 		};
 		const preview = formatRoutePriceOverridePreview(form);
@@ -723,9 +859,306 @@ describe('buildFormDataFromRoute / buildRouteSavePayload schedule', () => {
 	it('previews an error when a schedule window is invalid', () => {
 		const preview = formatRoutePriceOverridePreview({
 			...EMPTY_ROUTE_FORM,
-			schedule_windows: [{ start: '09:00', end: '09:00', charged_factor: '2', metered_factor: '2' }],
+			schedule_windows: [{ start: '09:00', end: '09:00', charged_factor: '2', metered_factor: '2', days: [] }],
 		});
 		assert.equal(preview.ok, false);
 		assert.match(preview.text, /duration must be non-zero/);
+	});
+
+	it('writes weekday and weekend days and omits a full week', () => {
+		const payload = buildRouteSavePayload(
+			{
+				...EMPTY_ROUTE_FORM,
+				model_id: 'm1',
+				provider_id: 'p1',
+				provider_model_name: 'gpt',
+				charged_factor: '1',
+				metered_factor: '1',
+				schedule_windows: [
+					{
+						start: '00:00',
+						end: '24:00',
+						charged_factor: '1.2',
+						metered_factor: '1.2',
+						days: [1, 2, 3, 4, 5],
+					},
+					{
+						start: '00:00',
+						end: '24:00',
+						charged_factor: '0.8',
+						metered_factor: '0.8',
+						days: [6, 7],
+					},
+				],
+			},
+			null,
+		);
+		assert.equal(
+			payload.price_override,
+			JSON.stringify({
+				charged_factor: 1,
+				metered_factor: 1,
+				schedule: {
+					mode: 'override',
+					charged: [
+						{ start: '00:00', end: '24:00', factor: 1.2, days: [1, 2, 3, 4, 5] },
+						{ start: '00:00', end: '24:00', factor: 0.8, days: [6, 7] },
+					],
+					metered: [
+						{ start: '00:00', end: '24:00', factor: 1.2, days: [1, 2, 3, 4, 5] },
+						{ start: '00:00', end: '24:00', factor: 0.8, days: [6, 7] },
+					],
+				},
+			}),
+		);
+
+		const form = buildFormDataFromRoute(
+			route({ price_override: String(payload.price_override) }),
+			[],
+		);
+		assert.deepEqual(form.schedule_windows, [
+			{ start: '00:00', end: '24:00', charged_factor: '1.2', metered_factor: '1.2', days: [1, 2, 3, 4, 5] },
+			{ start: '00:00', end: '24:00', charged_factor: '0.8', metered_factor: '0.8', days: [6, 7] },
+		]);
+		assert.equal(
+			formatSharedScheduleWindowsHint(resolveRouteScheduleDisplay(String(payload.price_override))),
+			'Mon–Fri 0:00-24:00 ×1.2 · Sat–Sun 0:00-24:00 ×0.8',
+		);
+	});
+
+	it('rebuilds route windows from catalog and keeps existing factors', () => {
+		const catalogModel = model({
+			id: 'm1',
+			pricing_profile: JSON.stringify({
+				tiers: [{ upto: null, input_price: 1, output_price: 2 }],
+				schedule: [
+					{ start: '00:30', end: '08:30', factor: 0.5 },
+					{ start: '09:00', end: '12:00', factor: 1.6, days: [1, 2, 3, 4, 5] },
+				],
+			}),
+		});
+		assert.deepEqual(catalogScheduleWindowsFromModel(catalogModel), [
+			{ start: '00:30', end: '08:30', factor: 0.5 },
+			{ start: '09:00', end: '12:00', factor: 1.6, days: [1, 2, 3, 4, 5] },
+		]);
+		assert.deepEqual(
+			alignRouteScheduleWindowsToCatalog(catalogScheduleWindowsFromModel(catalogModel), [
+				{ start: '00:30', end: '08:30', charged_factor: '0.8', metered_factor: '0.9', days: [] },
+				{ start: '13:00', end: '14:00', charged_factor: '3', metered_factor: '3', days: [] },
+			]),
+			[
+				{ start: '00:30', end: '08:30', days: [], charged_factor: '0.8', metered_factor: '0.9' },
+				{
+					start: '09:00',
+					end: '12:00',
+					days: [1, 2, 3, 4, 5],
+					charged_factor: '1',
+					metered_factor: '1',
+				},
+			],
+		);
+		const form = buildFormDataFromRoute(
+			route({
+				model_id: 'm1',
+				price_override: JSON.stringify({
+					charged_factor: 1,
+					metered_factor: 1,
+					schedule: {
+						mode: 'override',
+						charged: [{ start: '00:30', end: '08:30', factor: 0.7 }],
+						metered: [{ start: '00:30', end: '08:30', factor: 0.6 }],
+					},
+				}),
+			}),
+			[catalogModel],
+		);
+		assert.deepEqual(form.schedule_windows, [
+			{ start: '00:30', end: '08:30', days: [], charged_factor: '0.7', metered_factor: '0.6' },
+			{ start: '09:00', end: '12:00', days: [1, 2, 3, 4, 5], charged_factor: '1', metered_factor: '1' },
+		]);
+	});
+});
+
+describe('custom params headers / body form', () => {
+	it('splits stored custom_params into header rows and pretty-printed body', () => {
+		const parsed = parseCustomParamsForm(
+			JSON.stringify({
+				temperature: 0.7,
+				headers: { 'HTTP-Referer': 'https://example.com', 'X-Title': 'My App' },
+			}),
+		);
+		assert.equal(parsed.custom_params_json, JSON.stringify({ temperature: 0.7 }, null, 2));
+		assert.deepEqual(parsed.custom_headers, [
+			{ name: 'HTTP-Referer', value: 'https://example.com' },
+			{ name: 'X-Title', value: 'My App' },
+		]);
+	});
+
+	it('keeps invalid JSON in the body editor so the user can fix it', () => {
+		const parsed = parseCustomParamsForm('{not json');
+		assert.equal(parsed.custom_params_json, '{not json');
+		assert.deepEqual(parsed.custom_headers, []);
+	});
+
+	it('starts with no header rows when custom_params has no headers', () => {
+		assert.deepEqual(parseCustomParamsForm(null).custom_headers, []);
+		assert.deepEqual(parseCustomParamsForm(JSON.stringify({ temperature: 0.2 })).custom_headers, []);
+	});
+
+	it('round-trips headers and body through the route form', () => {
+		const form = buildFormDataFromRoute(
+			route({
+				custom_params: JSON.stringify({
+					temperature: 0.7,
+					headers: { 'HTTP-Referer': 'https://example.com', 'X-Title': 'My App' },
+				}),
+			}),
+			[],
+		);
+		assert.equal(form.custom_params_json, JSON.stringify({ temperature: 0.7 }, null, 2));
+		assert.deepEqual(form.custom_headers, [
+			{ name: 'HTTP-Referer', value: 'https://example.com' },
+			{ name: 'X-Title', value: 'My App' },
+		]);
+		const payload = buildRouteSavePayload(
+			{
+				...EMPTY_ROUTE_FORM,
+				...form,
+				model_id: 'm1',
+				provider_id: 'p1',
+				provider_model_name: 'gpt',
+			},
+			null,
+		);
+		assert.deepEqual(JSON.parse(String(payload.custom_params)), {
+			headers: { 'HTTP-Referer': 'https://example.com', 'X-Title': 'My App' },
+			body: { temperature: 0.7 },
+		});
+	});
+
+	it('saves headers-only custom_params without a body object', () => {
+		const payload = buildRouteSavePayload(
+			{
+				...EMPTY_ROUTE_FORM,
+				model_id: 'm1',
+				provider_id: 'p1',
+				provider_model_name: 'gpt',
+				custom_params_json: '',
+				custom_headers: [{ name: 'X-Title', value: 'My App' }],
+			},
+			null,
+		);
+		assert.deepEqual(JSON.parse(String(payload.custom_params)), {
+			headers: { 'X-Title': 'My App' },
+		});
+	});
+
+	it('omits empty headers and empty body', () => {
+		assert.equal(composeCustomParamsJson('', []), null);
+		assert.equal(composeCustomParamsJson('', [{ name: '', value: '' }]), null);
+		assert.equal(composeCustomParamsJson('  ', [{ name: '  ', value: 'x' }]), null);
+		assert.deepEqual(JSON.parse(composeCustomParamsJson('', [], { body: true }) ?? '{}'), {
+			force_override: { body: true },
+		});
+		const payload = buildRouteSavePayload(
+			{
+				...EMPTY_ROUTE_FORM,
+				model_id: 'm1',
+				provider_id: 'p1',
+				provider_model_name: 'gpt',
+			},
+			null,
+		);
+		assert.equal(payload.custom_params, null);
+	});
+
+	it('round-trips independent force_override flags through the envelope', () => {
+		const form = buildFormDataFromRoute(
+			route({
+				custom_params: JSON.stringify({
+					headers: { 'X-Title': 'My App' },
+					body: { max_tokens: 32000 },
+					force_override: { body: true },
+				}),
+			}),
+			[],
+		);
+		assert.equal(form.custom_params_force_override_body, true);
+		assert.equal(form.custom_params_force_override_headers, false);
+		const payload = buildRouteSavePayload(
+			{
+				...EMPTY_ROUTE_FORM,
+				...form,
+				model_id: 'm1',
+				provider_id: 'p1',
+				provider_model_name: 'gpt',
+				custom_params_force_override_headers: true,
+			},
+			null,
+		);
+		assert.equal(payload.custom_params_force_override, undefined);
+		assert.deepEqual(JSON.parse(String(payload.custom_params)), {
+			headers: { 'X-Title': 'My App' },
+			body: { max_tokens: 32000 },
+			force_override: { headers: true, body: true },
+		});
+	});
+
+	it('reads old flat custom_params with force override off', () => {
+		const form = buildFormDataFromRoute(
+			route({
+				custom_params: JSON.stringify({ temperature: 0.7, headers: { 'X-Title': 'A' } }),
+			}),
+			[],
+		);
+		assert.equal(form.custom_params_force_override_headers, false);
+		assert.equal(form.custom_params_force_override_body, false);
+		assert.equal(form.custom_params_json, JSON.stringify({ temperature: 0.7 }, null, 2));
+		const payload = buildRouteSavePayload(
+			{
+				...EMPTY_ROUTE_FORM,
+				...form,
+				model_id: 'm1',
+				provider_id: 'p1',
+				provider_model_name: 'gpt',
+			},
+			null,
+		);
+		assert.deepEqual(JSON.parse(String(payload.custom_params)), {
+			headers: { 'X-Title': 'A' },
+			body: { temperature: 0.7 },
+		});
+	});
+
+	it('defaults force override flags to false', () => {
+		const form = buildFormDataFromRoute(route(), []);
+		assert.equal(form.custom_params_force_override_headers, false);
+		assert.equal(form.custom_params_force_override_body, false);
+		const payload = buildRouteSavePayload(
+			{
+				...EMPTY_ROUTE_FORM,
+				model_id: 'm1',
+				provider_id: 'p1',
+				provider_model_name: 'gpt',
+			},
+			null,
+		);
+		assert.equal(payload.custom_params, null);
+		assert.equal(payload.custom_params_force_override, undefined);
+	});
+
+	it('strips a headers key pasted into the body editor', () => {
+		assert.deepEqual(
+			JSON.parse(
+				composeCustomParamsJson(
+					JSON.stringify({ temperature: 0.5, headers: { leftover: 'nope' } }),
+					[{ name: 'X-Title', value: 'My App' }],
+				) ?? '{}',
+			),
+			{
+				headers: { 'X-Title': 'My App' },
+				body: { temperature: 0.5 },
+			},
+		);
 	});
 });

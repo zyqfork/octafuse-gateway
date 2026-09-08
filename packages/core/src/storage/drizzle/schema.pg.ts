@@ -15,8 +15,12 @@ export const usersTable = pgTable(
 		budgetSpent: numeric('budget_spent', { precision: 18, scale: 6 }).notNull().default('0'),
 		budgetPeriod: text('budget_period').notNull().default('none'),
 		budgetResetAt: timestamp('budget_reset_at', { withTimezone: true, mode: 'string' }),
+		walletGranted: numeric('wallet_granted', { precision: 18, scale: 6 }).notNull().default('0'),
+		walletSpent: numeric('wallet_spent', { precision: 18, scale: 6 }).notNull().default('0'),
 		status: text('status').notNull().default('active'),
 		metadata: text('metadata'),
+		/** JSON：`{ rpm?: number }`；NULL = 该用户所有 Key 合计不限 */
+		rateLimit: text('rate_limit'),
 		/** `{ "<models.id>": factor }` JSON；NULL 表示无用户级 Charged 折扣 */
 		chargedCostFactors: text('charged_cost_factors'),
 		/** 上游命名空间（产品/租户），与 external_user_id 成对做幂等；纯网关用户二者皆空。 */
@@ -52,6 +56,8 @@ export const apiKeysTable = pgTable('api_keys', {
 	status: text('status').notNull().default('active'),
 	metadata: text('metadata'),
 	lastUsedAt: timestamp('last_used_at', { withTimezone: true, mode: 'string' }),
+	/** JSON：`{ rpm?: number }`；NULL = 不限 */
+	rateLimit: text('rate_limit'),
 	createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull(),
 	updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'string' }).notNull(),
 });
@@ -176,6 +182,7 @@ export const apiKeyRequestLogsTable = pgTable('api_key_request_logs', {
 	meteredCost: numeric('metered_cost', { precision: 18, scale: 6 }).notNull().default('0'),
 	standardCost: numeric('standard_cost', { precision: 18, scale: 6 }).notNull().default('0'),
 	chargedCost: numeric('charged_cost', { precision: 18, scale: 6 }).notNull().default('0'),
+	chargedWalletCost: numeric('charged_wallet_cost', { precision: 18, scale: 6 }).notNull().default('0'),
 	routeGroup: text('route_group').notNull().default('default'),
 	status: text('status').notNull().default('success'),
 	latencyMs: integer('latency_ms'),
@@ -202,6 +209,7 @@ export const apiKeyRequestLogsTable = pgTable('api_key_request_logs', {
 	outputImageCount: integer('output_image_count').notNull().default(0),
 	audioDurationSeconds: real('audio_duration_seconds'),
 	audioCharacters: integer('audio_characters'),
+	ingressHost: text('ingress_host'),
 	createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull(),
 });
 
@@ -229,6 +237,7 @@ export const userAuditLogsTable = pgTable('user_audit_logs', {
 	actorId: text('actor_id'),
 	reasonCode: text('reason_code'),
 	reasonText: text('reason_text'),
+	dedupKey: text('dedup_key'),
 	createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull(),
 });
 

@@ -52,12 +52,14 @@
 |文件|进程|默认端口|运行层说明|
 |------|------|--------|----------|
 |`Dockerfile.proxy`|`node packages/proxy/dist/runtime/node.js`（构建阶段已 `npm run build` **core + proxy**）|`8787`|**已编译** `packages/{core,proxy}/dist` + 生产 `node_modules`（core / tool-engines / proxy）；`@octafuse/*` 已打进 proxy bundle，运行层**不**需要 tool-engines 源码。|
-|`Dockerfile.admin`|Next **standalone**（`node packages/admin/server.js`）|`8789`|**`.next/standalone` + `.next/static` + `public`**；另含运行所需的 `@octafuse/core` 构建产物与 **`postgres` / `mysql2`** 依赖子集；仅负责应用进程。|
+|`Dockerfile.admin`|Next **standalone** + 实时 WS 入口（`node packages/admin/node-server.mjs`）|`8789`|**`.next/standalone` + `.next/static` + `public`**；另含运行所需的 `@octafuse/core` 构建产物、**`postgres` / `mysql2`** 与 **`ws`**。`node-server.mjs` 已把 **`drizzle-orm` / `hono`** 打进 bundle，运行层不必再 COPY 这两包；仅负责应用进程。生产入口从 `.next/required-server-files.json` 读取构建期配置并设置 `__NEXT_PRIVATE_STANDALONE_CONFIG`（standalone 裁掉了 `compiled/webpack`，镜像内也没有 `next.config.mjs`）。调试台实时语音识别走自定义 HTTP Upgrade，不经过 Next App Router。|
 |`Dockerfile.migrate`|一次性迁移 Job：`node packages/core/dist/migrate/cli.js`（无参数时由入口按 `DATABASE_DRIVER` 选择 `--driver`）|—|仅 **`@octafuse/core`** 构建产物与 SQL 目录；**`ENTRYPOINT`** [`../../../docker/entrypoint.migrate.sh`](../../../docker/entrypoint.migrate.sh)；供 **`--profile migrate`** / **`GATEWAY_MIGRATE_IMAGE`**。|
 
 **代理服务 Node bundle 契约**：`packages/proxy/scripts/build.mjs` 用 esbuild 把所有 `@octafuse/*`（含 `@octafuse/core` 子路径与 `@octafuse/tool-engines`）打进 `dist/runtime/node.js`，仅把真实 npm 依赖（`hono`、`postgres` 等）标为 external。构建结束会校验产物中**不存在** `@octafuse/` 外部说明符；也可单独跑 `npm run verify:proxy-bundle`。
 
-**管理后台镜像与 Cloudflare 构建分工**：`Dockerfile.admin` 在构建阶段执行 **`npm run build:docker -w @octafuse/admin`**（`next build` + `scripts/link-standalone-next.mjs`），**不**运行 `wrangler types`，因此镜像构建不依赖 **`workerd`**，可与 `npm ci --ignore-scripts` 的 CI 安装方式兼容。构建阶段会 **`COPY packages/tool-engines`**（调试台（Playground）Tools 与代理服务共用的引擎客户端，source-only），**不**再 COPY `packages/proxy`。部署到 Cloudflare（预览/生产）仍使用 **`npm run build:cf`** / **`npm run preview`** / **`npm run deploy`**（内含 `cf-typegen` 与 OpenNext Cloudflare 打包）。各 Dockerfile 在 `npm ci --ignore-scripts` 之后会 **`find node_modules -path '*/esbuild/install.js' -exec node {} \;`**：为树内**每一份** esbuild 执行其 `install.js`（`@octafuse/core` 与 `@opennextjs/*` 可能各带不同版本）。勿用 **`npm rebuild esbuild`**，否则多版本 esbuild 会触发「Expected 0.25.4 but got 0.27.3」类校验错误。
+开发改 `packages/core` 或管理后台后，提交前先跑 **`npm run typecheck:admin`**（约数秒）。改自定义入口或 `Dockerfile.admin` 后再跑 **`npm run build:docker -w @octafuse/admin && npm run verify:standalone -w @octafuse/admin`**：后者把 standalone 拷到系统临时目录再启动，拦住仓库内向上解析到根 `node_modules/next` 的假阴性（容器里会变成 `Cannot find module 'next/dist/compiled/webpack/webpack-lib'`）。`verify` 不执行 `next build`；PR 的 Docker 冒烟才会在镜像里做类型检查。
+
+**管理后台镜像与 Cloudflare 构建分工**：`Dockerfile.admin` 在构建阶段执行 **`npm run build:docker -w @octafuse/admin`**（`next build` + `scripts/link-standalone-next.mjs` + `scripts/build-node-server.mjs`），**不**运行 `wrangler types`，因此镜像构建不依赖 **`workerd`**，可与 `npm ci --ignore-scripts` 的 CI 安装方式兼容。`build-node-server.mjs` 把 `runtime/node-server.ts` 打进 standalone 时：`@/lib/*` 必须再走 esbuild 默认解析（补 `.ts` / `index`），不要把别名 join 成无扩展名绝对路径；**只**把 `next` / `ws` / `postgres` / `mysql2` 标为 external，`drizzle-orm` / `hono` 必须打进 bundle（运行层没有这两包，全量 external 会 `ERR_MODULE_NOT_FOUND: drizzle-orm`）。自定义入口在生产模式读取 `.next/required-server-files.json` 的 `config` 并设置 `__NEXT_PRIVATE_STANDALONE_CONFIG`（与官方 `standalone/.../server.js` 一致）。构建结束用 esbuild metafile 校验未登记的裸导入。本地确认启动契约：`npm run verify:standalone -w @octafuse/admin`。构建阶段会 **`COPY packages/tool-engines`**（调试台（Playground）Tools 与代理服务共用的引擎客户端，source-only），**不**再 COPY `packages/proxy`。部署到 Cloudflare（预览/生产）仍使用 **`npm run build:cf`** / **`npm run preview`** / **`npm run deploy`**（内含 `cf-typegen` 与 OpenNext Cloudflare 打包）。各 Dockerfile 在 `npm ci --ignore-scripts` 之后会 **`find node_modules -path '*/esbuild/install.js' -exec node {} \;`**：为树内**每一份** esbuild 执行其 `install.js`（`@octafuse/core` 与 `@opennextjs/*` 可能各带不同版本）。勿用 **`npm rebuild esbuild`**，否则多版本 esbuild 会触发「Expected 0.25.4 but got 0.27.3」类校验错误。
 
 典型未压缩体积：**proxy** 常见约 **一百多 MB**；**admin** 因 Next standalone 与 trace 较大，常见约 **两百 MB 量级**；**migrate** 最小。若仍见 **~1GB+** 单层或总量异常，多为旧版单阶段镜像或本地缓存标签，请 `docker build --no-cache` 重建后对比 `docker image ls` / `docker history`。
 
@@ -300,22 +302,58 @@ server {
 }
 ```
 
+同一代理服务对外挂多个主机名时，在反代上列出全部 `server_name`（或为每个主机名写一个指向同一上游的站点块）。代理进程本身不解析主机名，也不读取 `PROXY_CUSTOM_DOMAIN`（该变量仅用于 Cloudflare `gen-wrangler`）：
+
+```nginx
+server {
+  listen 443 ssl;
+  server_name gateway.example.com relay.example.com;
+
+  ssl_certificate     /etc/nginx/certs/fullchain.pem;
+  ssl_certificate_key /etc/nginx/certs/privkey.pem;
+
+  location / {
+    proxy_pass http://127.0.0.1:8787;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+}
+```
+
 Caddy（自动申请证书时）：
 
 ```caddy
 gateway-admin.example.com {
   reverse_proxy 127.0.0.1:8789
 }
+
+gateway.example.com, relay.example.com {
+  reverse_proxy 127.0.0.1:8787
+}
 ```
+
+回滚：从反代配置中去掉多余主机名并重载；DNS 记录可一并删除。
 
 ## 8. 如何更新版本
 
-升级前阅读目标版本 [GitHub Release](https://github.com/OctaFuse/octafuse-gateway/releases) / `CHANGELOG.md` 中的 **升级说明**（破坏性变更、必做迁移、维护窗口）。推荐顺序：**先 migrate，再滚动重启代理服务 / 管理后台**；或仅在一侧开启 `AUTO_MIGRATE=1`（见 §5）。
+升级前阅读目标版本 [GitHub Release](https://github.com/OctaFuse/octafuse-gateway/releases) / `CHANGELOG.md` 中的 **升级说明**（破坏性变更、必做迁移、维护窗口）。默认顺序是**先 migrate，再滚动重启代理服务 / 管理后台**；或仅在一侧开启 `AUTO_MIGRATE=1`（见 §5）。若目标版本声明专用顺序，应以该版本说明为准。
+
+> **升级到 v2.8.0**：必须应用迁移 **0027**。v2.8.0 服务会直接读取新列，请在维护窗口内备份并暂停请求及额度写入，使用 v2.8.0 migrate 镜像先执行迁移，再立即启动同版本 Proxy / Admin；禁止新旧版本混跑。服务核验通过后，门户再改用 `POST /api/admin/users/:id/wallet/credit`，不要再通过累加 `budget_max` 发放购买额度。迁移前可使用 [0027 只读审计脚本](../migrations/0027-user-wallet-credit-audit.sql) 核对回填范围。
 
 ### 8.1 预构建镜像（GHCR / 私有 registry）
 
 1. 编辑宿主机 env（通常在 `docker/deploy/`，由 `docker/examples/env.*.example` 复制）：将 `GATEWAY_PROXY_IMAGE`、`GATEWAY_ADMIN_IMAGE`、`GATEWAY_MIGRATE_IMAGE` 的 **tag** 改为目标版本（生产钉死 `vX.Y.Z`；需要可复现固定时从 GHCR 包页核对 **digest**）。
-2. 拉取 → 迁移 → 重建：
+2. 拉取镜像。升级到 v2.8.0 时，先暂停请求及额度写入，再按“迁移 → 启动同版本服务”的顺序执行：
+
+```bash
+docker compose --env-file docker/deploy/.env.local -f docker/examples/gateway.compose.yml pull
+docker compose --env-file docker/deploy/.env.local -f docker/examples/gateway.compose.yml --profile migrate run --rm migrate
+docker compose --env-file docker/deploy/.env.local -f docker/examples/gateway.compose.yml up -d gateway-proxy gateway-admin
+```
+
+其他版本未声明专用顺序时，沿用“迁移 → 重建”的默认流程：
 
 ```bash
 docker compose --env-file docker/deploy/.env.local -f docker/examples/gateway.compose.yml pull
@@ -329,11 +367,11 @@ docker compose --env-file docker/deploy/.env.local -f docker/examples/gateway.co
 
 ```bash
 git pull --ff-only
-docker compose -f docker/compose/node-pg.yml --profile migrate run --rm migrate
 docker compose -f docker/compose/node-pg.yml up -d --build gateway-proxy gateway-admin
+docker compose -f docker/compose/node-pg.yml --profile migrate run --rm migrate
 ```
 
-MySQL 将 `node-pg.yml` 换成 `node-mysql.yml`。一键体验：`docker compose -f docker/compose/quickstart.yml up --build -d`。
+以上命令展示 v2.8.0 的专用顺序。其他版本仍以对应 Release 为准。MySQL 将 `node-pg.yml` 换成 `node-mysql.yml`。一键体验：`docker compose -f docker/compose/quickstart.yml up --build -d`。
 
 ### 8.3 升级后验收
 

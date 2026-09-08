@@ -18,7 +18,12 @@ describe('playground samples', () => {
 			for (const sampleId of PLAYGROUND_LLM_SAMPLE_IDS) {
 				const rules = sampleRoutes[family][sampleId];
 				assert.ok(rules.length > 0, `${family}.${sampleId} has no routes`);
-				assert.equal(rules[rules.length - 1]?.when, undefined, `${family}.${sampleId} needs a default route`);
+				const lastRule = rules[rules.length - 1];
+				assert.equal(
+					lastRule && 'when' in lastRule ? lastRule.when : undefined,
+					undefined,
+					`${family}.${sampleId} needs a default route`,
+				);
 				for (const rule of rules) {
 					assert.ok(registered.has(rule.id), `missing JSON for ${rule.id}`);
 					JSON.parse(loadPlaygroundSampleBody(family, sampleId));
@@ -38,6 +43,10 @@ describe('playground samples', () => {
 		);
 		assert.equal(
 			resolvePlaygroundSampleId('openai_chat', 'connectivity', 'gpt-5.4'),
+			'openai-chat/connectivity.max-completion',
+		);
+		assert.equal(
+			resolvePlaygroundSampleId('openai_chat', 'connectivity', 'gpt-6-astra'),
 			'openai-chat/connectivity.max-completion',
 		);
 	});

@@ -7,6 +7,7 @@
  */
 import type { GatewayRepositories, RouteStrategyName, UpstreamProtocol } from '@octafuse/core';
 import { DEFAULT_ROUTE_STRATEGY, fingerprintProviderApiKey } from '@octafuse/core';
+import { overlayClientHeadersOnRouteCustomParams } from '@octafuse/core/route-custom-params';
 import type { RoutePoolStickyRoutingConfig } from '@octafuse/core/db/route-pool-sticky-types';
 import type { RouteResult } from './model-router';
 import type { UsageFromStream } from './proxy';
@@ -68,6 +69,8 @@ export type ProxyDispatchMeta = {
 	parsedBody?: unknown;
 	/** 仅 Images：上游 wait 被 abort 时由 driver 写入（见 openai-images-driver） */
 	imageAbortReason?: ImageDispatchAbortReason;
+	/** 仅 DashScope 生图：由上游 usage 推导的 per_image 档位（如 `1k` / `2k`） */
+	imageBillingSize?: string | null;
 	/** 仅 Audio transcriptions：计费时长（秒） */
 	audioDurationSeconds?: number | null;
 	/** 仅 Audio：duration 来源 */
@@ -121,6 +124,8 @@ export type FailoverDispatchOptions = {
 	routePoolId?: string | null;
 	/** Pool sticky config from surface join */
 	sticky?: RoutePoolStickyRoutingConfig | null;
+	/** Incoming user request headers; used to overlay route `custom_params.headers` when force override is off. */
+	inboundHeaders?: Headers;
 };
 
 type DispatchFn = (
@@ -207,13 +212,20 @@ export async function failoverDispatch(
 		? expectedProtocol
 		: [expectedProtocol];
 	const fallbackProtocol = expectedProtocols[0]!;
-	const protocolRoutes = routes.filter((route) => {
-		if (expectedProtocols.includes(route.upstreamProtocol)) return true;
-		console.warn(
-			`[Gateway Proxy] unsupported protocol, skipping providerId=${route.providerId} protocol=${route.upstreamProtocol}`
-		);
-		return false;
-	});
+	const protocolRoutes = routes
+		.filter((route) => {
+			if (expectedProtocols.includes(route.upstreamProtocol)) return true;
+			console.warn(
+				`[Gateway Proxy] unsupported protocol, skipping providerId=${route.providerId} protocol=${route.upstreamProtocol}`
+			);
+			return false;
+		})
+		.map((route) => {
+			const customParams = overlayClientHeadersOnRouteCustomParams(route.customParams, {
+				clientHeaders: options?.inboundHeaders,
+			});
+			return customParams === route.customParams ? route : { ...route, customParams };
+		});
 
 	if (protocolRoutes.length === 0) {
 		return {

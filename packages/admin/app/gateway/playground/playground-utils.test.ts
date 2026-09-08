@@ -10,11 +10,16 @@ import {
 	PLAYGROUND_LLM_SAMPLE_IDS,
 	playgroundLlmFamilyForRoute,
 	playgroundLlmSampleBody,
+	previewPlaygroundMergedBody,
+	previewPlaygroundOutboundHeaderRows,
+	previewPlaygroundRouteHeaders,
+	formatPlaygroundRouteHeadersPreview,
 	resolvePlaygroundLlmFamily,
 	routeMatchesSearch,
 	templateForRoute,
 	type PlaygroundLlmFamily,
 } from './playground-utils';
+import { IMAGE_GENERATIONS_BODY_TEMPLATE } from '@/lib/image-generations';
 import type { RouteListRow } from './types';
 
 function route(overrides: Partial<RouteListRow> = {}): RouteListRow {
@@ -45,6 +50,21 @@ describe('playground-utils', () => {
 		assert.equal(routeMatchesSearch(r, 'openai.chat'), true);
 		assert.equal(routeMatchesSearch(r, 'route-abc'), true);
 		assert.equal(routeMatchesSearch(r, 'anthropic'), false);
+	});
+
+	it('templateForRoute uses Images JSON for DashScope image routes', () => {
+		assert.equal(
+			templateForRoute(
+				route({
+					upstream_protocol: 'dashscope',
+					upstream_operation: 'images.generations.multimodal',
+					adapter: 'dashscope-image-qwen',
+				}),
+				{ output_modalities: '["image"]' } as never,
+				'edits',
+			),
+			IMAGE_GENERATIONS_BODY_TEMPLATE,
+		);
 	});
 
 	it('templateForRoute picks Responses vs Chat from upstream_operation', () => {
@@ -181,6 +201,10 @@ describe('playground-utils', () => {
 		const fable5 = parse('claude-fable-5');
 		assert.equal(fable5.thinking?.type, 'adaptive');
 
+		const fable51 = parse('claude-fable-5-1');
+		assert.equal(fable51.thinking?.type, 'adaptive');
+		assert.equal(fable51.output_config?.effort, 'high');
+
 		const sonnet4 = parse('claude-sonnet-4', 'claude-sonnet-4-20250514');
 		assert.equal(sonnet4.thinking?.type, 'enabled');
 		assert.equal(sonnet4.output_config, undefined);
@@ -225,6 +249,12 @@ describe('playground-utils', () => {
 		assert.equal(gpt5.reasoning_effort, 'medium');
 		assert.equal(gpt5.max_completion_tokens, 4096);
 		assert.equal(gpt5.max_tokens, undefined);
+		const gpt6 = JSON.parse(
+			playgroundLlmSampleBody('openai_chat', 'reasoning', { modelId: 'gpt-6-astra' }),
+		) as { reasoning_effort?: string; max_tokens?: number; max_completion_tokens?: number };
+		assert.equal(gpt6.reasoning_effort, 'medium');
+		assert.equal(gpt6.max_completion_tokens, 4096);
+		assert.equal(gpt6.max_tokens, undefined);
 	});
 
 	it('uses OpenAI-compat vendor thinking fields for DeepSeek, GLM, Qwen, MiniMax, and Kimi', () => {
@@ -278,6 +308,12 @@ describe('playground-utils', () => {
 		assert.equal(gpt5.max_completion_tokens, 256);
 		assert.equal(gpt5.max_tokens, undefined);
 
+		const gpt6 = JSON.parse(
+			playgroundLlmSampleBody('openai_chat', 'connectivity', { modelId: 'gpt-6-astra' }),
+		) as { max_completion_tokens?: number; max_tokens?: number };
+		assert.equal(gpt6.max_completion_tokens, 256);
+		assert.equal(gpt6.max_tokens, undefined);
+
 		const gemini25 = JSON.parse(
 			playgroundLlmSampleBody('gemini', 'tools', { modelId: 'gemini-2.5-flash' }),
 		) as { toolConfig?: { functionCallingConfig?: { streamFunctionCallArguments?: boolean } } };
@@ -312,5 +348,150 @@ describe('playground-utils', () => {
 		assert.equal(isPlaygroundBodyDirty(BODY_TEMPLATES.openai, BODY_TEMPLATES.openai), false);
 		assert.equal(isPlaygroundBodyDirty(`  ${BODY_TEMPLATES.openai}  `, BODY_TEMPLATES.openai), false);
 		assert.equal(isPlaygroundBodyDirty('{ "messages": [] }', BODY_TEMPLATES.openai), true);
+	});
+
+	it('previewPlaygroundMergedBody merges custom_params with user fields winning', () => {
+		const result = previewPlaygroundMergedBody({
+			bodyText: JSON.stringify({ model: 'glm-5.3', stream: true, messages: [] }),
+			customParams: JSON.stringify({ tool_stream: true, stream: false }),
+			upstreamProtocol: 'openai',
+			providerModelName: 'glm-5.3-upstream',
+		});
+		assert.equal(result.status, 'preview');
+		const body = JSON.parse(result.json) as {
+			tool_stream?: boolean;
+			stream?: boolean;
+			model?: string;
+		};
+		assert.equal(body.tool_stream, true);
+		assert.equal(body.stream, true);
+		assert.equal(body.model, 'glm-5.3-upstream');
+	});
+
+	it('previewPlaygroundMergedBody deep-merges nested custom_params objects', () => {
+		const result = previewPlaygroundMergedBody({
+			bodyText: JSON.stringify({ parameters: { temperature: 0.2 } }),
+			customParams: JSON.stringify({ parameters: { temperature: 0.8, tool_stream: true } }),
+			upstreamProtocol: 'dashscope',
+			providerModelName: 'qwen-audio',
+		});
+		assert.equal(result.status, 'preview');
+		const body = JSON.parse(result.json) as {
+			model?: string;
+			parameters?: { temperature?: number; tool_stream?: boolean };
+		};
+		assert.equal(body.model, 'qwen-audio');
+		assert.equal(body.parameters?.temperature, 0.2);
+		assert.equal(body.parameters?.tool_stream, true);
+	});
+
+	it('previewPlaygroundMergedBody does not rewrite Gemini model and rejects invalid JSON', () => {
+		const preview = previewPlaygroundMergedBody({
+			bodyText: JSON.stringify({ contents: [] }),
+			customParams: JSON.stringify({ generationConfig: { thinkingConfig: { includeThoughts: true } } }),
+			upstreamProtocol: 'gemini',
+			providerModelName: 'gemini-3.1-pro',
+		});
+		assert.equal(preview.status, 'preview');
+		const body = JSON.parse(preview.json) as { model?: string; generationConfig?: unknown };
+		assert.equal(body.model, undefined);
+		assert.ok(body.generationConfig);
+		assert.equal(previewPlaygroundMergedBody({ bodyText: '{not json' }).status, 'invalid');
+	});
+
+	it('previewPlaygroundMergedBody strips custom_params.headers from the body preview', () => {
+		const result = previewPlaygroundMergedBody({
+			bodyText: JSON.stringify({ messages: [] }),
+			customParams: JSON.stringify({
+				temperature: 0.5,
+				headers: { 'HTTP-Referer': 'https://example.com' },
+			}),
+			upstreamProtocol: 'openai',
+			providerModelName: 'gpt-4o-mini',
+		});
+		assert.equal(result.status, 'preview');
+		const body = JSON.parse(result.json) as { temperature?: number; headers?: unknown; model?: string };
+		assert.equal(body.temperature, 0.5);
+		assert.equal(body.headers, undefined);
+		assert.equal(body.model, 'gpt-4o-mini');
+	});
+
+	it('previewPlaygroundMergedBody lets route fields win when force_override.body is on', () => {
+		const result = previewPlaygroundMergedBody({
+			bodyText: JSON.stringify({ model: 'glm-5.3', max_tokens: 8000, messages: [] }),
+			customParams: JSON.stringify({
+				body: { max_tokens: 32000, thinking: { type: 'enabled' } },
+				force_override: { body: true },
+			}),
+			upstreamProtocol: 'openai',
+			providerModelName: 'glm-5.3-upstream',
+		});
+		assert.equal(result.status, 'preview');
+		const body = JSON.parse(result.json) as {
+			max_tokens?: number;
+			thinking?: { type?: string };
+			model?: string;
+		};
+		assert.equal(body.max_tokens, 32000);
+		assert.equal(body.thinking?.type, 'enabled');
+		assert.equal(body.model, 'glm-5.3-upstream');
+	});
+
+	it('previewPlaygroundRouteHeaders lists extra headers and skips protected names', () => {
+		assert.deepEqual(previewPlaygroundRouteHeaders(null), {});
+		assert.equal(formatPlaygroundRouteHeadersPreview({}), '');
+		const headers = previewPlaygroundRouteHeaders(
+			JSON.stringify({
+				temperature: 0.5,
+				headers: {
+					'HTTP-Referer': 'https://example.com',
+					'X-Title': 'My App',
+					Authorization: 'Bearer secret',
+				},
+			}),
+		);
+		assert.deepEqual(headers, {
+			'HTTP-Referer': 'https://example.com',
+			'X-Title': 'My App',
+		});
+		assert.equal(
+			formatPlaygroundRouteHeadersPreview(headers),
+			'HTTP-Referer: https://example.com\nX-Title: My App',
+		);
+	});
+
+	it('previewPlaygroundOutboundHeaderRows merges driver headers and tags custom_params', () => {
+		const rows = previewPlaygroundOutboundHeaderRows({
+			customParams: JSON.stringify({
+				headers: { x: '1', Authorization: 'Bearer secret' },
+			}),
+			upstreamProtocol: 'openai',
+		});
+		assert.deepEqual(
+			rows.map((row) => ({ name: row.name, source: row.source })),
+			[
+				{ name: 'Content-Type', source: 'provider' },
+				{ name: 'Authorization', source: 'provider' },
+				{ name: 'x', source: 'custom_params' },
+			],
+		);
+		const tagged = rows.find((row) => row.name === 'x');
+		assert.equal(tagged?.value, '1');
+	});
+
+	it('previewPlaygroundOutboundHeaderRows prefers sent headers and still tags extras', () => {
+		const rows = previewPlaygroundOutboundHeaderRows({
+			customParams: JSON.stringify({ headers: { x: '1' } }),
+			upstreamProtocol: 'openai',
+			sentHeaders: {
+				'Content-Type': 'application/json',
+				Authorization: 'Bearer sk-abcd…mnop',
+				'X-DashScope-Async': 'enable',
+				x: '1',
+			},
+		});
+		assert.equal(rows.find((row) => row.name === 'X-DashScope-Async')?.source, 'provider');
+		assert.equal(rows.find((row) => row.name === 'x')?.source, 'custom_params');
+		assert.equal(rows.find((row) => row.name === 'Authorization')?.value, 'Bearer sk-abcd…mnop');
 	});
 });

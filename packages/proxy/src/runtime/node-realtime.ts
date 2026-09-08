@@ -4,8 +4,9 @@
  */
 import { createRequire } from 'node:module';
 import type { IncomingHttpHeaders, IncomingMessage } from 'node:http';
-import { resolveProviderUpstreamSecret } from '@octafuse/core';
+import { applyRouteExtraHeaders, resolveProviderUpstreamSecret } from '@octafuse/core';
 import { resolveUpstreamEndpoint } from '@octafuse/core/provider-endpoints';
+import { pickDashScopeRealtimeSubprotocol } from '@octafuse/core/realtime-protocol';
 import type { UsageFromStream } from '../services/proxy';
 import { EMPTY_USAGE } from '../services/proxy';
 import type { ProxyDispatchResult } from '../services/failover-dispatch';
@@ -16,6 +17,7 @@ import type {
 } from '../services/egress/dashscope-realtime-driver';
 import {
 	DashScopeRealtimeUsageCollector,
+	normalizeWebSocketCloseCode,
 	rewriteDashScopeRealtimeClientMessage,
 } from '../services/egress/dashscope-realtime-driver';
 import type {
@@ -47,6 +49,8 @@ export interface NodeWebSocket {
 	off(event: 'error', listener: (error: Error) => void): this;
 	send(data: string | Buffer): void;
 	close(code?: number, reason?: string): void;
+	pause(): void;
+	resume(): void;
 }
 
 export type NodeWebSocketConstructor = new (
@@ -89,7 +93,16 @@ function toHeaders(raw: IncomingHttpHeaders): Headers {
 
 function closeSocket(socket: NodeWebSocket, code = 1000, reason = ''): void {
 	if (socket.readyState === NODE_WS_CLOSED) return;
-	socket.close(code, reason.slice(0, 123));
+	const safeCode = normalizeWebSocketCloseCode(code);
+	try {
+		socket.close(safeCode, reason.slice(0, 123));
+	} catch {
+		try {
+			socket.close(1000);
+		} catch {
+			// ignore
+		}
+	}
 }
 
 function realtimeCapability(operation: DashScopeRealtimeOperation):
@@ -119,7 +132,7 @@ async function connectUpstream(
 
 	const { secret } = await resolveProviderUpstreamSecret(route.providerApiKey);
 	const upstream = new WebSocketCtor(url.toString(), {
-		headers: { Authorization: `Bearer ${secret}` },
+		headers: applyRouteExtraHeaders({ Authorization: `Bearer ${secret}` }, route.customParams),
 	});
 	let requestId: string | null = null;
 	let settled = false;
@@ -242,15 +255,21 @@ export function createNodeDashScopeRealtimeDispatch(
 			const onClientClose = (code: number, reason: Buffer) => {
 				clientClosedFirst = true;
 				clientClosedBeforeOpen = upstream == null;
-				if (upstream) closeSocket(upstream, code, reason.toString());
-				finishUsage();
+				try {
+					if (upstream) closeSocket(upstream, code, reason.toString());
+				} finally {
+					finishUsage();
+				}
 			};
 			const onClientError = () => {
 				clientClosedFirst = true;
 				clientClosedBeforeOpen = upstream == null;
 				streamError = 'Client WebSocket transport error';
-				if (upstream) closeSocket(upstream, 1011, 'Client WebSocket error');
-				finishUsage(streamError);
+				try {
+					if (upstream) closeSocket(upstream, 1011, 'Client WebSocket error');
+				} finally {
+					finishUsage(streamError);
+				}
 			};
 			const onUpstreamMessage = (data: Buffer, isBinary: boolean) => {
 				try {
@@ -264,19 +283,28 @@ export function createNodeDashScopeRealtimeDispatch(
 				}
 			};
 			const onUpstreamClose = (code: number, reason: Buffer) => {
-				closeSocket(client, code, reason.toString());
-				finishUsage(code === 1000 ? null : `Upstream WebSocket closed with code ${code}`);
+				try {
+					closeSocket(client, code, reason.toString());
+				} finally {
+					finishUsage(code === 1000 ? null : `Upstream WebSocket closed with code ${code}`);
+				}
 			};
 			const onUpstreamError = () => {
 				streamError = 'Upstream WebSocket transport error';
-				closeSocket(client, 1011, 'Upstream WebSocket error');
-				finishUsage(streamError);
+				try {
+					closeSocket(client, 1011, 'Upstream WebSocket error');
+				} finally {
+					finishUsage(streamError);
+				}
 			};
 			const onAbort = () => {
 				streamError = 'Gateway request aborted';
-				closeSocket(client, 1000, 'Gateway request aborted');
-				if (upstream) closeSocket(upstream, 1000, 'Gateway request aborted');
-				finishUsage(streamError);
+				try {
+					closeSocket(client, 1000, 'Gateway request aborted');
+					if (upstream) closeSocket(upstream, 1000, 'Gateway request aborted');
+				} finally {
+					finishUsage(streamError);
+				}
 			};
 			const cleanupClient = () => {
 				client.off('message', onClientMessage);
@@ -334,6 +362,6 @@ export function createNodeDashScopeRealtimeDispatch(
 export function createNodeWebSocketServer(): NodeWebSocketServer {
 	return new wsModule.WebSocketServer({
 		noServer: true,
-		handleProtocols: (protocols) => protocols.values().next().value ?? false,
+		handleProtocols: (protocols) => pickDashScopeRealtimeSubprotocol(protocols),
 	});
 }

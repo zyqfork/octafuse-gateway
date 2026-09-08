@@ -8,8 +8,29 @@ export * from './provider-endpoints';
 export * from './gemini-upstream-url';
 export * from './gcp-service-account-token';
 export * from './vertex-openai-model';
+export {
+	ADAPTER_REGISTRY,
+	adaptersForModelKind,
+	getAdapterById,
+	getAdapterByOptionKey,
+	getAdapterByPresetIntent,
+	listConversionAdapters,
+	listSelectableAdapters,
+	requestOperationsFromRegistry,
+	requestSurfacePath,
+	requiredCapabilitiesForUpstreamOperation,
+	SURFACE_PATH_MODEL_PLACEHOLDER,
+	upstreamOperationsFromRegistry,
+	type AdapterBilling,
+	type AdapterDescriptor,
+	type AdapterExchange,
+	type AdapterModality,
+	type AdapterModelKind,
+	type AdapterPresetIntent,
+} from './adapters/registry';
 export * from './route-topology';
 export * from './realtime-protocol';
+export * from './route-custom-params';
 
 export * from './storage/context';
 export * from './storage/database-client';
@@ -33,12 +54,14 @@ export * from './db/model-route-policy';
 export * from './db/route-pool-tier-strategies';
 export * from './db/route-pool-sticky-types';
 export * from './db/request-logs-types';
+export * from './db/wallet-credit';
 export * from './db/pricing-audit';
 export * from './db/pricing-profile';
 export * from './db/image-token-usage';
 export * from './db/audio-token-usage';
 export * from './db/image-per-image-usage';
 export * from './db/pricing-schedule';
+export * from './db/display-discount';
 export * from './db/user-charged-cost-factors';
 export * from './db/model-modalities';
 export * from './db/request-log-status-filter';
@@ -54,11 +77,13 @@ export * from './lib/web-deep-search-system-config';
 export * from './lib/ai-detection-system-config';
 export * from './lib/tool-pricing';
 export * from './lib/route-strategy-system-config';
+export * from './lib/api-key-rate-limit';
 export * from './lib/money-precision';
 export * from './lib/string-utils';
 export * from './lib/time-format';
 export * from './lib/resolve-me-metadata';
 
 export * from './services/user-service';
+export * from './services/wallet-balance';
 export * from './services/budget-transition-service';
 export * from './services/key-service';

@@ -15,6 +15,44 @@ describe("routeMatchesSurface", () => {
 			),
 			true
 		);
+		assert.equal(
+			routeMatchesSurface(
+				{
+					adapter: "dashscope-asr-qwen-audio-file",
+					upstreamProtocol: "dashscope",
+					upstreamOperation: "audio.transcriptions.multimodal",
+				},
+				{ protocol: "openai", operation: "audio.transcriptions" }
+			),
+			true
+		);
+	});
+
+	it("accepts DashScope image conversion adapters for an OpenAI Images surface", () => {
+		for (const adapter of ["dashscope-image-qwen", "dashscope-image-wan"]) {
+			assert.equal(
+				routeMatchesSurface(
+					{
+						adapter,
+						upstreamProtocol: "dashscope",
+						upstreamOperation: "images.generations.multimodal",
+					},
+					{ protocol: "openai", operation: "images.generations" }
+				),
+				true
+			);
+			assert.equal(
+				routeMatchesSurface(
+					{
+						adapter,
+						upstreamProtocol: "dashscope",
+						upstreamOperation: "*",
+					},
+					{ protocol: "openai", operation: "images.generations" }
+				),
+				true
+			);
+		}
 	});
 
 	it("rejects a cross-protocol passthrough target", () => {

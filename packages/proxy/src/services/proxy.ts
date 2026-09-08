@@ -8,25 +8,19 @@ import { dispatchOpenAiRoute } from "./egress/openai-driver";
 import { dispatchOpenAiResponsesRoute } from "./egress/openai-responses-driver";
 import {
 	dispatchOpenAiImageEdits,
-	dispatchOpenAiImageGenerations,
 	type NormalizedImageEditRequest,
 } from "./egress/openai-images-driver";
+import type { NormalizedAudioTranscriptionRequest } from "./egress/openai-audio-driver";
+import type { DashScopeAsrDispatchOptions } from "./egress/dashscope-audio-driver";
 import {
-	dispatchOpenAiAudioTranscriptions,
-	type NormalizedAudioTranscriptionRequest,
-} from "./egress/openai-audio-driver";
-import {
-	dispatchDashScopeAsyncAsr,
-	dispatchDashScopeSyncAsr,
-	type DashScopeAsrDispatchOptions,
-} from "./egress/dashscope-audio-driver";
-import {
-	dispatchDashScopeMiniMaxTts,
-	dispatchDashScopeQwenTts,
-	dispatchDashScopeSpeechSynthesizer,
-	dispatchOpenAiAudioSpeech,
-	type AudioSpeechDispatchOptions,
-	type NormalizedAudioSpeechRequest,
+	dispatchAudioSpeech,
+	dispatchAudioTranscriptions,
+	dispatchImageGenerations,
+	dispatchMultimodalPassthrough,
+} from "./egress/dispatch-table";
+import type {
+	AudioSpeechDispatchOptions,
+	NormalizedAudioSpeechRequest,
 } from "./egress/audio-speech-driver";
 import {
 	dispatchDashScopeRealtime,
@@ -208,13 +202,13 @@ export async function proxyImageGenerations(
 	return failoverDispatch(
 		repos,
 		routes,
-		"openai",
+		["openai", "dashscope"],
 		(
 			route,
 			signal,
 			timing?: RequestTimingCollector | null,
 			attempt?: RequestTimingAttempt
-		) => dispatchOpenAiImageGenerations(route, body, signal, timing, attempt),
+		) => dispatchImageGenerations(route, body, signal, timing, attempt),
 		requestSignal,
 		options
 	);
@@ -264,46 +258,15 @@ export async function proxyAudioTranscriptions(
 			signal,
 			timing?: RequestTimingCollector | null,
 			attempt?: RequestTimingAttempt
-		) => {
-			if (
-				route.adapter === "passthrough" &&
-				route.upstreamProtocol === "openai"
-			) {
-				return dispatchOpenAiAudioTranscriptions(
-					route,
-					req,
-					signal,
-					timing,
-					attempt
-				);
-			}
-			if (
-				route.adapter === "dashscope-asr-qwen-file" ||
-				route.adapter === "dashscope-asr-fun-file"
-			) {
-				return dispatchDashScopeSyncAsr(
-					route,
-					req,
-					signal,
-					timing,
-					attempt,
-					options?.dashScope
-				);
-			}
-			if (route.adapter === "dashscope-asr-file-async") {
-				return dispatchDashScopeAsyncAsr(
-					route,
-					req,
-					signal,
-					timing,
-					attempt,
-					options?.dashScope
-				);
-			}
-			throw new Error(
-				`Unsupported audio transcription adapter: ${route.adapter}`
-			);
-		},
+		) =>
+			dispatchAudioTranscriptions(
+				route,
+				req,
+				signal,
+				timing,
+				attempt,
+				options?.dashScope
+			),
 		requestSignal,
 		options
 	);
@@ -326,52 +289,39 @@ export async function proxyAudioSpeech(
 			signal,
 			timing?: RequestTimingCollector | null,
 			attempt?: RequestTimingAttempt
-		) => {
-			if (
-				route.adapter === "passthrough" &&
-				route.upstreamProtocol === "openai"
-			) {
-				return dispatchOpenAiAudioSpeech(
-					route,
-					request,
-					signal,
-					timing,
-					attempt,
-					options
-				);
-			}
-			if (route.adapter === "dashscope-tts-speech") {
-				return dispatchDashScopeSpeechSynthesizer(
-					route,
-					request,
-					signal,
-					timing,
-					attempt,
-					options
-				);
-			}
-			if (route.adapter === "dashscope-tts-qwen") {
-				return dispatchDashScopeQwenTts(
-					route,
-					request,
-					signal,
-					timing,
-					attempt,
-					options
-				);
-			}
-			if (route.adapter === "dashscope-tts-minimax") {
-				return dispatchDashScopeMiniMaxTts(
-					route,
-					request,
-					signal,
-					timing,
-					attempt,
-					options
-				);
-			}
-			throw new Error(`Unsupported audio speech adapter: ${route.adapter}`);
-		},
+		) =>
+			dispatchAudioSpeech(route, request, signal, timing, attempt, options),
+		requestSignal,
+		options
+	);
+}
+
+/** 代理 DashScope 同步多模态 ASR HTTP 透传（原生 JSON，不转 OpenAI transcriptions）。 */
+export async function proxyDashScopeMultimodalPassthrough(
+	repos: GatewayRepositories,
+	routes: RouteResult[],
+	body: Record<string, unknown>,
+	requestSignal?: AbortSignal,
+	options?: AudioTranscriptionProxyOptions
+): Promise<ProxyResult> {
+	return failoverDispatch(
+		repos,
+		routes,
+		"dashscope",
+		(
+			route,
+			signal,
+			timing?: RequestTimingCollector | null,
+			attempt?: RequestTimingAttempt
+		) =>
+			dispatchMultimodalPassthrough(
+				route,
+				body,
+				signal,
+				timing,
+				attempt,
+				options?.dashScope
+			),
 		requestSignal,
 		options
 	);

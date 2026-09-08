@@ -13,13 +13,16 @@
  *
  * 各预设内 **`pricing.usd`** 与 D1 导出 `data/remote/.../data-remote-table-models-*.sql` 中 `pricing_profile` 一致（美元口径）；
  * **`pricing.cny`**：国内厂商以中国区官方/Postgres 价为准；海外厂商（openai / anthropic / google / xai 等）按 **USD × 7** 换算占位。
- * 导入时按当前 `BILLING_CURRENCY` 选用 `usd` / `cny` 之一写入 `pricing_profile`。
+ * 导入时按当前 `BILLING_CURRENCY` 选用 `usd` / `cny` **整段**写入 `pricing_profile`（含可选 `schedule` 官方时段，不只 `tiers`）。
+ * DeepSeek V4 目录价为空闲价；`schedule` 为北京时间工作日高峰 09:00–12:00、14:00–18:00、`factor` 2。命中按 `BUSINESS_TIMEZONE` 墙钟，中国区请设 `Asia/Shanghai`。
+ * Google Gemini 目录价为 Standard 标准价，不含限时导入价、Batch、Flex。Flash 3.7 / 3.8 写入 $1.50 / $7.50，而不是 2026-12-31 前的 $0.75 / $3.75。
  * 面向 Catalog 的英文摘要与中英文展示文案均与模型预设共同维护：
  * `description` 写入现有 `models.description`，`i18n` 仅供静态 Catalog 展示，不增加数据库字段。
  *
  * 合并顺序：与下方 import 列表一致（尚未录入价目的厂商保留 `[]` 占位文件；image 文件紧挨同 vendor 的 LLM 之后）。
  */
 import aliyunPresets from './model-presets/aliyun.json';
+import aliyunImagePresets from './model-presets/aliyun-image.json';
 import anthropicPresets from './model-presets/anthropic.json';
 import baichuanPresets from './model-presets/baichuan.json';
 import baiduPresets from './model-presets/baidu.json';
@@ -66,13 +69,12 @@ export type StaticModelPresetRow = {
 	vendor?: string | null;
 	context_window?: number | null;
 	max_tokens?: number | null;
-	/** Gateway `model_tags` (e.g. `New`, `Hot`, `Discount:0.3` for VIP/default, `Discount.free:0.5` for free route). */
-	tags?: string[];
 	/** OpenRouter-style input/output modalities. */
 	modalities?: StaticModelPresetModalities;
 	/** Model release date `YYYY-MM-DD`. */
 	released?: string | null;
 	pricing: {
+		/** Catalog branch written as `pricing_profile` (tiers / image / audio plus optional `schedule`). */
 		usd: unknown;
 		cny: unknown;
 	};
@@ -80,6 +82,7 @@ export type StaticModelPresetRow = {
 
 const STATIC_MODEL_PRESETS_BY_VENDOR = [
 	aliyunPresets,
+	aliyunImagePresets,
 	anthropicPresets,
 	baichuanPresets,
 	baiduPresets,
@@ -112,6 +115,7 @@ export function listStaticModelPresets(): StaticModelPresetRow[] {
 	return [...STATIC_MODEL_PRESETS_BY_VENDOR.flat()] as StaticModelPresetRow[];
 }
 
+/** Returns the `usd` / `cny` object as-is, including optional catalog `schedule`. */
 export function pickPresetPricingRawForBillingCurrency(
 	preset: StaticModelPresetRow,
 	billing: GatewaySupportedBillingCurrency

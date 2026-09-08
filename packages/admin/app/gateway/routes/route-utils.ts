@@ -1,3 +1,4 @@
+import { parsePricingProfile } from '@octafuse/core/db/pricing-profile';
 import {
 	isAudioModel,
 	isAudioSpeechModel,
@@ -13,6 +14,7 @@ import {
 } from '@octafuse/core/db/model-route-policy';
 import { parseRoutePoolTierStrategies } from '@octafuse/core/db/route-pool-tier-strategies';
 import { parseRoutePoolStickyConfig } from '@octafuse/core/db/route-pool-sticky-types';
+import { composeRouteCustomParamsEnvelope, splitRouteCustomParams } from '@octafuse/core/route-custom-params';
 import {
 	ANTHROPIC_ENDPOINT_CAPABILITIES,
 	DASHSCOPE_ENDPOINT_CAPABILITIES,
@@ -29,12 +31,29 @@ import {
 	ROUTE_ADAPTERS,
 } from '@octafuse/core/route-topology';
 import {
+	adaptersForModelKind,
+	getAdapterByOptionKey,
+	getAdapterByPresetIntent,
+	listSelectableAdapters,
+	requestOperationsFromRegistry,
+	requestSurfacePath as requestSurfacePathFromRegistry,
+	requiredCapabilitiesForUpstreamOperation,
+	SURFACE_PATH_MODEL_PLACEHOLDER,
+	upstreamOperationsFromRegistry,
+	type AdapterDescriptor,
+	type AdapterModelKind,
+	type AdapterPresetIntent,
+} from '@octafuse/core/adapters/registry';
+import {
 	findDailyWindowOverlap,
+	formatIsoWeekdaysHint,
 	mergeScheduleSidesToSharedWindows,
+	normalizeIsoWeekdays,
 	normalizeScheduleFactor,
 	parseHhMmToMinutes,
 	parseRouteBaseFactors,
 	parseRoutePricingSchedule,
+	scheduleWindowKey,
 	type DailyScheduleWindow,
 	type SharedScheduleWindow,
 } from '@octafuse/core/db/pricing-schedule';
@@ -47,11 +66,13 @@ import {
 	DEFAULT_ROUTE_KIND_FILTER,
 	FACTOR_CHIP_BASE,
 	PROTOCOL_DISPLAY_LABEL,
+	type RouteCustomHeaderRow,
 	type RouteFormData,
 	type RouteKindFilter,
 	type RouteListRow,
 	type RouteProtocolGroupSection,
 	type RouteScheduleFormSide,
+	type RouteScheduleFormWindow,
 	type RouteStrategySource,
 } from './types';
 
@@ -70,53 +91,11 @@ export function getProtocolDisplayLabel(protocol: string): string {
 }
 
 /** 跨模型汇总时路径里的模型占位符（Gemini / DashScope 入口含 model）。 */
-export const SURFACE_PATH_MODEL_PLACEHOLDER = '{model}';
+export { SURFACE_PATH_MODEL_PLACEHOLDER };
 
 /** 将公开协议操作映射为客户端实际调用路径，避免把带点的操作名直接拼进 URL。 */
 export function requestSurfacePath(protocol: string, operation: string, modelId?: string): string {
-	const modelSegment =
-		modelId && modelId.length > 0 ? modelId : SURFACE_PATH_MODEL_PLACEHOLDER;
-	if (protocol === 'openai') {
-		const paths: Record<string, string> = {
-			chat: '/v1/chat/completions',
-			responses: '/v1/responses',
-			'images.generations': '/v1/images/generations',
-			'images.edits': '/v1/images/edits',
-			'audio.transcriptions': '/v1/audio/transcriptions',
-			'audio.speech': '/v1/audio/speech',
-		};
-		return operation === '*' ? '/v1/*' : paths[operation] ?? `/v1/${operation}`;
-	}
-	if (protocol === 'anthropic') {
-		return operation === '*' ? '/v1/*' : '/v1/messages';
-	}
-	if (protocol === 'gemini') {
-		// `models.generate` 是路由族标识；真实客户端仍使用两种 Gemini wire action。
-		if (operation === 'models.generate') {
-			return `/v1beta/models/${modelSegment}:{generateContent|streamGenerateContent}`;
-		}
-		return `/v1beta/models/${modelSegment}:${operation}`;
-	}
-	if (protocol === 'dashscope') {
-		if (operation.includes('.realtime.')) {
-			// 原生实时操作共享一个 WSS 入口，模型与操作通过查询参数选择。
-			const modelParam =
-				modelId && modelId.length > 0
-					? encodeURIComponent(modelId)
-					: SURFACE_PATH_MODEL_PLACEHOLDER;
-			return `/v1/dashscope/realtime?model=${modelParam}&operation=${encodeURIComponent(operation)}`;
-		}
-		const paths: Record<string, string> = {
-			'audio.speech': '/v1/audio/speech',
-			'audio.speech.stream': '/v1/audio/speech',
-			'audio.speech.multimodal': '/v1/audio/speech',
-			'audio.transcriptions': '/v1/audio/transcriptions',
-			'audio.transcriptions.multimodal': '/v1/audio/transcriptions',
-			'audio.transcriptions.async': '/v1/audio/transcriptions',
-		};
-		return operation === '*' ? '/*' : paths[operation] ?? `/${operation}`;
-	}
-	return operation === '*' ? '/*' : `/${operation}`;
+	return requestSurfacePathFromRegistry(protocol, operation, modelId);
 }
 
 /**
@@ -502,16 +481,8 @@ export function buildRoutePriceOverride(formData: RouteFormData): Record<string,
 	if (scheduleWindows.length > 0) {
 		priceOverride.schedule = {
 			mode: 'override',
-			charged: scheduleWindows.map((w) => ({
-				start: w.start,
-				end: w.end,
-				factor: w.charged_factor,
-			})),
-			metered: scheduleWindows.map((w) => ({
-				start: w.start,
-				end: w.end,
-				factor: w.metered_factor,
-			})),
+			charged: scheduleWindows.map((w) => persistScheduleSideWindow(w, w.charged_factor)),
+			metered: scheduleWindows.map((w) => persistScheduleSideWindow(w, w.metered_factor)),
 		};
 	}
 	return priceOverride;
@@ -531,6 +502,36 @@ export function formatRoutePriceOverridePreview(formData: RouteFormData): {
 	}
 }
 
+function persistableScheduleDays(days: number[] | undefined): number[] | undefined {
+	if (!days || days.length === 0) {
+		return undefined;
+	}
+	const normalized = normalizeIsoWeekdays(days);
+	if (normalized === null) {
+		return undefined;
+	}
+	return normalized;
+}
+
+function persistScheduleSideWindow(
+	w: Pick<SharedScheduleWindow, 'start' | 'end' | 'days'>,
+	factor: number,
+): DailyScheduleWindow {
+	const days = persistableScheduleDays(w.days);
+	return days ? { start: w.start, end: w.end, factor, days } : { start: w.start, end: w.end, factor };
+}
+
+function parseFormScheduleDays(days: number[] | undefined, index: number): number[] | undefined {
+	if (!days || days.length === 0) {
+		return undefined;
+	}
+	const normalized = normalizeIsoWeekdays(days);
+	if (normalized === null) {
+		throw new Error(`Schedule window ${index + 1}: days must be a non-empty unique array of integers 1–7`);
+	}
+	return normalized;
+}
+
 function validateSharedScheduleWindows(windows: RouteScheduleFormSide): SharedScheduleWindow[] {
 	const cleaned: SharedScheduleWindow[] = [];
 	for (let i = 0; i < windows.length; i++) {
@@ -547,15 +548,17 @@ function validateSharedScheduleWindows(windows: RouteScheduleFormSide): SharedSc
 				`Schedule window ${i + 1}: start must be HH:mm, end may also be 24:00, and duration must be non-zero`,
 			);
 		}
+		const days = parseFormScheduleDays(w.days, i);
 		cleaned.push({
 			start,
 			end,
 			charged_factor: parseSharedWindowFactor(w.charged_factor, 'Charged factor', i),
 			metered_factor: parseSharedWindowFactor(w.metered_factor, 'Metered factor', i),
+			...(days ? { days } : {}),
 		});
 	}
 	const overlap = findDailyWindowOverlap(
-		cleaned.map((w) => ({ start: w.start, end: w.end, factor: w.charged_factor })),
+		cleaned.map((w) => ({ start: w.start, end: w.end, factor: w.charged_factor, days: w.days })),
 	);
 	if (overlap) {
 		throw new Error(`Schedule: ${overlap}`);
@@ -567,8 +570,122 @@ export function formatScheduleFactorText(n: number): string {
 	return String(normalizeScheduleFactor(n));
 }
 
-export function buildFormDataFromRoute(route: GatewayModelRoute, _models: GatewayModel[]): RouteFormData {
+export function catalogScheduleWindowsFromModel(
+	model: GatewayModel | undefined | null
+): DailyScheduleWindow[] {
+	return parsePricingProfile(model?.pricing_profile ?? undefined)?.schedule ?? [];
+}
+
+export function alignRouteScheduleWindowsToCatalog(
+	catalog: DailyScheduleWindow[],
+	existing: RouteScheduleFormWindow[],
+	defaultFactor = '1'
+): RouteScheduleFormWindow[] {
+	if (catalog.length === 0) {
+		return existing;
+	}
+	const byKey = new Map(existing.map((w) => [scheduleWindowKey(w), w]));
+	return catalog.map((w) => {
+		const prev = byKey.get(scheduleWindowKey(w));
+		return {
+			start: w.start,
+			end: w.end,
+			days: w.days ? [...w.days] : [],
+			charged_factor: prev?.charged_factor ?? defaultFactor,
+			metered_factor: prev?.metered_factor ?? defaultFactor,
+		};
+	});
+}
+
+export function emptyCustomHeaderRows(): RouteCustomHeaderRow[] {
+	return [];
+}
+
+export function customHeaderRowsHaveValues(rows: RouteCustomHeaderRow[]): boolean {
+	return rows.some((row) => row.name.trim().length > 0 || row.value.trim().length > 0);
+}
+
+/** 将 `custom_params` JSON 拆成请求体编辑区、HTTP 头行与分侧强制覆盖。 */
+export function parseCustomParamsForm(raw: string | null | undefined): {
+	custom_params_json: string;
+	custom_headers: RouteCustomHeaderRow[];
+	custom_params_force_override_headers: boolean;
+	custom_params_force_override_body: boolean;
+} {
+	const empty = {
+		custom_params_json: '',
+		custom_headers: emptyCustomHeaderRows(),
+		custom_params_force_override_headers: false,
+		custom_params_force_override_body: false,
+	};
+	const text = raw?.trim() ?? '';
+	if (!text) return empty;
+	try {
+		const parsed = JSON.parse(text) as unknown;
+		if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+			return { ...empty, custom_params_json: text };
+		}
+		const split = splitRouteCustomParams(parsed as Record<string, unknown>);
+		const bodyJson = Object.keys(split.body).length > 0 ? JSON.stringify(split.body, null, 2) : '';
+		const headerRows = Object.entries(split.extraHeaders).map(([name, value]) => ({ name, value }));
+		return {
+			custom_params_json: bodyJson,
+			custom_headers: headerRows.length > 0 ? headerRows : emptyCustomHeaderRows(),
+			custom_params_force_override_headers: split.forceOverrideHeaders,
+			custom_params_force_override_body: split.forceOverrideBody,
+		};
+	} catch {
+		return { ...empty, custom_params_json: text };
+	}
+}
+
+/** 把表单的请求体 JSON、头行与分侧强制覆盖合成信封。空则返回 null。 */
+export function composeCustomParamsJson(
+	bodyJson: string,
+	headers: RouteCustomHeaderRow[],
+	forceOverride?: { headers?: boolean; body?: boolean },
+): string | null {
+	const extraHeaders: Record<string, string> = {};
+	for (const row of headers) {
+		const name = row.name.trim();
+		if (!name) continue;
+		extraHeaders[name] = row.value;
+	}
+
+	const bodyText = bodyJson.trim();
+	let body: Record<string, unknown> = {};
+	if (bodyText) {
+		const parsed = JSON.parse(bodyText) as unknown;
+		if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+			throw new Error('custom_params must be a JSON object');
+		}
+		body = { ...(parsed as Record<string, unknown>) };
+	}
+
+	const envelope = composeRouteCustomParamsEnvelope({
+		body,
+		extraHeaders,
+		forceOverrideHeaders: forceOverride?.headers,
+		forceOverrideBody: forceOverride?.body,
+	});
+	return envelope ? JSON.stringify(envelope) : null;
+}
+
+export function routeHasCustomParamsForceOverride(raw: string | null | undefined): boolean {
+	const parsed = parseCustomParamsForm(raw);
+	return parsed.custom_params_force_override_headers || parsed.custom_params_force_override_body;
+}
+
+export function buildFormDataFromRoute(route: GatewayModelRoute, models: GatewayModel[]): RouteFormData {
 	const factors = parseRouteBaseFactors(route.price_override ?? null);
+	const existingWindows = resolveRouteScheduleDisplay(route.price_override).map((w) => ({
+		start: w.start,
+		end: w.end,
+		charged_factor: formatScheduleFactorText(w.charged_factor),
+		metered_factor: formatScheduleFactorText(w.metered_factor),
+		days: w.days ?? [],
+	}));
+	const catalog = catalogScheduleWindowsFromModel(models.find((m) => m.id === route.model_id));
 	return {
 		model_id: route.model_id,
 		provider_id: route.provider_id,
@@ -589,16 +706,11 @@ export function buildFormDataFromRoute(route: GatewayModelRoute, _models: Gatewa
 		adapter: route.adapter ?? 'passthrough',
 		priority: route.priority,
 		weight: Number(route.weight ?? 1) || 1,
-		custom_params_json: route.custom_params ?? '',
+		...parseCustomParamsForm(route.custom_params),
 		route_group: route.route_group ?? 'default',
 		charged_factor: String(factors.chargedFactor),
 		metered_factor: String(factors.meteredFactor),
-		schedule_windows: resolveRouteScheduleDisplay(route.price_override).map((w) => ({
-			start: w.start,
-			end: w.end,
-			charged_factor: formatScheduleFactorText(w.charged_factor),
-			metered_factor: formatScheduleFactorText(w.metered_factor),
-		})),
+		schedule_windows: alignRouteScheduleWindowsToCatalog(catalog, existingWindows),
 	};
 }
 
@@ -606,16 +718,6 @@ export function buildRouteSavePayload(
 	formData: RouteFormData,
 	editingRoute: GatewayModelRoute | null,
 ): Record<string, unknown> {
-	const normalizeJsonText = (raw: string, fieldName: string): string | null => {
-		const text = raw.trim();
-		if (!text) return null;
-		const parsed = JSON.parse(text) as unknown;
-		if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-			throw new Error(`${fieldName} must be a JSON object`);
-		}
-		return JSON.stringify(parsed);
-	};
-
 	const priceOverride = buildRoutePriceOverride(formData);
 
 	const payload: Record<string, unknown> = {
@@ -631,7 +733,10 @@ export function buildRouteSavePayload(
 		weight: Math.max(1, Math.floor(Number(formData.weight) || 1)),
 		route_group: formData.route_group.trim() || 'default',
 		price_override: JSON.stringify(priceOverride),
-		custom_params: normalizeJsonText(formData.custom_params_json, 'custom_params'),
+		custom_params: composeCustomParamsJson(formData.custom_params_json, formData.custom_headers, {
+			headers: formData.custom_params_force_override_headers,
+			body: formData.custom_params_force_override_body,
+		}),
 	};
 	if (!editingRoute) {
 		payload.status = 'inactive';
@@ -646,71 +751,110 @@ export const CAPABILITIES_BY_PROTOCOL: Record<string, readonly ProviderEndpointC
 	dashscope: DASHSCOPE_ENDPOINT_CAPABILITIES,
 };
 
+export function modelKindForModel(model: GatewayModel | undefined): AdapterModelKind {
+	if (model && isImageGenerationModel(model)) return 'image';
+	if (model && isAudioTranscriptionModel(model)) return 'audio.transcription';
+	if (model && isAudioSpeechModel(model)) return 'audio.speech';
+	return 'llm';
+}
+
+function sortOperationsForProtocol(protocol: UpstreamProtocol, operations: readonly string[]): string[] {
+	const order = REQUEST_OPERATIONS_BY_PROTOCOL[protocol] as readonly string[];
+	return [...operations].sort((a, b) => {
+		const ia = order.indexOf(a);
+		const ib = order.indexOf(b);
+		return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib);
+	});
+}
+
+function filterRealtimeOperations(operations: readonly string[], providerModelName: string): string[] {
+	if (!providerModelName.trim()) return [...operations];
+	return operations.filter((operation) =>
+		isDashScopeRealtimeAsrModelOperationCompatible(providerModelName, operation),
+	);
+}
+
 /** Public operations that make sense for the selected model modality. */
 export function requestOperationsForModel(
 	model: GatewayModel | undefined,
 	protocol: UpstreamProtocol,
 	providerModelName = '',
 ): readonly string[] {
-	if (model && isImageGenerationModel(model)) {
-		return protocol === 'openai' ? ['images.generations', 'images.edits'] : [];
-	}
-	if (model && isAudioTranscriptionModel(model)) {
-		if (protocol === 'openai') return ['audio.transcriptions'];
-		if (protocol === 'dashscope') {
-			const operations = [
-				'audio.transcriptions.realtime.inference',
-				'audio.transcriptions.realtime.session',
-			];
-			// 供应商模型填写后只展示其真实协议，避免 Fun-ASR 被误配到 Qwen3 session。
-			return providerModelName.trim()
-				? operations.filter((operation) =>
-						isDashScopeRealtimeAsrModelOperationCompatible(providerModelName, operation),
-				  )
-				: operations;
+	if (
+		model &&
+		(isImageGenerationModel(model) || isAudioTranscriptionModel(model) || isAudioSpeechModel(model) || (isTextLlmModel(model) && protocol === 'openai'))
+	) {
+		const kind = modelKindForModel(model);
+		const operations = requestOperationsFromRegistry(protocol, kind);
+		if (kind === 'audio.transcription' && protocol === 'dashscope') {
+			return filterRealtimeOperations(operations, providerModelName);
 		}
-		return [];
-	}
-	if (model && isAudioSpeechModel(model)) {
-		if (protocol === 'openai') return ['audio.speech'];
-		if (protocol === 'dashscope') {
-			// Qwen-Audio-TTS/CosyVoice 实时接口使用 inference 任务协议；
-			// Qwen-TTS-Realtime session 不在本项目支持范围内。
-			return ['audio.speech.realtime.inference'];
-		}
-		return [];
-	}
-	if (model && isTextLlmModel(model) && protocol === 'openai') {
-		return ['chat', 'responses'];
+		return operations;
 	}
 	return REQUEST_OPERATIONS_BY_PROTOCOL[protocol];
 }
 
+export type DashScopeAsrRoutePreset = 'flash-convert' | 'flash-passthrough' | 'filetrans';
 export type DashScopeTtsRoutePreset = 'realtime' | 'nonrealtime';
+export type DashScopeImageRoutePreset = 'qwen' | 'wan';
+
+/**
+ * 将 DashScope ASR 的用户意图转换为完整路由拓扑。
+ * flash 转换保持 OpenAI 兼容入口；透传使用原生 multimodal HTTP；filetrans 走异步 submit/poll。
+ */
+const ASR_PRESET_INTENT: Record<DashScopeAsrRoutePreset, AdapterPresetIntent> = {
+	'flash-convert': 'dashscope-asr-flash-convert',
+	'flash-passthrough': 'dashscope-asr-flash-passthrough',
+	filetrans: 'dashscope-asr-filetrans',
+};
+
+export function applyAdapterDescriptorToForm(
+	formData: RouteFormData,
+	descriptor: AdapterDescriptor,
+): RouteFormData {
+	return {
+		...formData,
+		request_protocol: descriptor.request.protocol,
+		request_operation: descriptor.request.operation,
+		upstream_protocol: descriptor.upstream.protocol,
+		upstream_operation: descriptor.upstream.operations[0] ?? descriptor.request.operation,
+		adapter: descriptor.id,
+	};
+}
+
+export function applyDashScopeAsrRoutePreset(formData: RouteFormData, preset: DashScopeAsrRoutePreset): RouteFormData {
+	const descriptor = getAdapterByPresetIntent(ASR_PRESET_INTENT[preset]);
+	if (!descriptor) return formData;
+	return applyAdapterDescriptorToForm(formData, descriptor);
+}
 
 /**
  * 将 DashScope TTS 的用户意图转换为完整路由拓扑。
  * 非实时模式保持 OpenAI 兼容入口，实时模式使用网关原生 DashScope WSS 入口。
  */
+const TTS_PRESET_INTENT: Record<DashScopeTtsRoutePreset, AdapterPresetIntent> = {
+	nonrealtime: 'dashscope-tts-nonrealtime',
+	realtime: 'dashscope-tts-realtime',
+};
+
 export function applyDashScopeTtsRoutePreset(formData: RouteFormData, preset: DashScopeTtsRoutePreset): RouteFormData {
-	if (preset === 'nonrealtime') {
-		return {
-			...formData,
-			request_protocol: 'openai',
-			request_operation: 'audio.speech',
-			upstream_protocol: 'dashscope',
-			upstream_operation: 'audio.speech',
-			adapter: 'dashscope-tts-speech',
-		};
-	}
-	return {
-		...formData,
-		request_protocol: 'dashscope',
-		request_operation: 'audio.speech.realtime.inference',
-		upstream_protocol: 'dashscope',
-		upstream_operation: 'audio.speech.realtime.inference',
-		adapter: 'passthrough',
-	};
+	const descriptor = getAdapterByPresetIntent(TTS_PRESET_INTENT[preset]);
+	if (!descriptor) return formData;
+	return applyAdapterDescriptorToForm(formData, descriptor);
+}
+
+const IMAGE_PRESET_INTENT: Record<DashScopeImageRoutePreset, AdapterPresetIntent> = {
+	qwen: 'dashscope-image-qwen',
+	wan: 'dashscope-image-wan',
+};
+
+export function applyDashScopeImageRoutePreset(
+	formData: RouteFormData,
+	preset: DashScopeImageRoutePreset,
+): RouteFormData {
+	const descriptor = getAdapterByPresetIntent(IMAGE_PRESET_INTENT[preset]);
+	if (!descriptor) return formData;
+	return applyAdapterDescriptorToForm(formData, descriptor);
 }
 
 /**
@@ -730,54 +874,92 @@ export function upstreamOperationsForProviderModel(
 	const providerOperations = listConfiguredCapabilities(map, protocol);
 	const capabilities = new Set(providerOperations);
 
-	// DashScope 路由能力表示协议生命周期，供应商能力表示具体端点；此处显式映射。
-	if (model && isAudioTranscriptionModel(model)) {
-		if (protocol === 'openai') {
-			return capabilities.has('audio.transcriptions') ? ['audio.transcriptions'] : [];
+	if (model && (isImageGenerationModel(model) || isAudioTranscriptionModel(model) || isAudioSpeechModel(model))) {
+		const kind = modelKindForModel(model);
+		const listed = sortOperationsForProtocol(protocol, upstreamOperationsFromRegistry(protocol, kind));
+		const operations = listed.filter((operation) => {
+			const required = requiredCapabilitiesForUpstreamOperation(protocol, operation);
+			return required.every((capability) => capabilities.has(capability as ProviderEndpointCapability));
+		});
+		if (kind === 'audio.transcription') {
+			return filterRealtimeOperations(operations, providerModelName);
 		}
-		if (protocol === 'dashscope') {
-			const operations: string[] = [];
-			if (capabilities.has('audio.transcriptions') && capabilities.has('audio.transcriptions.tasks')) {
-				operations.push('audio.transcriptions.async');
-			}
-			if (
-				capabilities.has('audio.realtime.inference') &&
-				isDashScopeRealtimeAsrModelOperationCompatible(
-					providerModelName,
-					'audio.transcriptions.realtime.inference',
-				)
-			) {
-				operations.push('audio.transcriptions.realtime.inference');
-			}
-			if (
-				capabilities.has('audio.realtime.session') &&
-				isDashScopeRealtimeAsrModelOperationCompatible(
-					providerModelName,
-					'audio.transcriptions.realtime.session',
-				)
-			) {
-				operations.push('audio.transcriptions.realtime.session');
-			}
-			return operations;
-		}
-		return [];
-	}
-	if (model && isAudioSpeechModel(model)) {
-		if (protocol === 'openai') {
-			return capabilities.has('audio.speech') ? ['audio.speech'] : [];
-		}
-		if (protocol === 'dashscope') {
-			const operations: string[] = [];
-			if (capabilities.has('audio.speech')) operations.push('audio.speech');
-			if (capabilities.has('audio.realtime.inference')) {
-				operations.push('audio.speech.realtime.inference');
-			}
-			return operations;
-		}
-		return [];
+		return operations;
 	}
 	const modelOperations = new Set(requestOperationsForModel(model, protocol));
 	return providerOperations.filter((operation) => modelOperations.has(operation));
+}
+
+export type AdapterOptionAvailability = {
+	descriptor: AdapterDescriptor;
+	available: boolean;
+	missingCapabilities: readonly string[];
+};
+
+export function listAdapterOptionsForModel(
+	model: GatewayModel | undefined,
+	provider: GatewayProvider | undefined,
+	providerModelName = '',
+): AdapterOptionAvailability[] {
+	const kind = modelKindForModel(model);
+	const capabilities = new Set<string>();
+	if (provider) {
+		const map = parseProviderEndpoints(provider);
+		for (const protocol of UPSTREAM_PROTOCOLS) {
+			if (!map[protocol]) continue;
+			for (const capability of listConfiguredCapabilities(map, protocol)) {
+				capabilities.add(capability);
+			}
+		}
+	}
+	return adaptersForModelKind(kind)
+		.filter((descriptor) => {
+			if (kind !== 'audio.transcription') return true;
+			return isDashScopeRealtimeAsrModelOperationCompatible(
+				providerModelName,
+				descriptor.request.operation,
+			);
+		})
+		.map((descriptor) => {
+			const missingCapabilities = provider
+				? descriptor.requiredUpstreamCapabilities.filter((capability) => !capabilities.has(capability))
+				: descriptor.requiredUpstreamCapabilities;
+			return {
+				descriptor,
+				available: missingCapabilities.length === 0 && Boolean(provider),
+				missingCapabilities,
+			};
+		});
+}
+
+export function resolveAdapterOptionKey(formData: Pick<RouteFormData, 'adapter' | 'request_protocol' | 'request_operation' | 'upstream_protocol' | 'upstream_operation'>): string | null {
+	const match = listSelectableAdapters().find(
+		(descriptor) =>
+			descriptor.id === formData.adapter &&
+			descriptor.request.protocol === formData.request_protocol &&
+			descriptor.request.operation === formData.request_operation &&
+			descriptor.upstream.protocol === formData.upstream_protocol &&
+			descriptor.upstream.operations.includes(formData.upstream_operation),
+	);
+	return match?.optionKey ?? null;
+}
+
+export function applyAdapterOptionToForm(formData: RouteFormData, optionKey: string): RouteFormData {
+	const descriptor = getAdapterByOptionKey(optionKey);
+	if (!descriptor) return formData;
+	return applyAdapterDescriptorToForm(formData, descriptor);
+}
+
+/** 下拉项后缀：透传只标 request；转换标 request → upstream。 */
+export function adapterOptionMappingSuffix(descriptor: AdapterDescriptor): string {
+	const from = `${descriptor.request.protocol}/${descriptor.request.operation}`;
+	if (descriptor.id === 'passthrough') {
+		return ` · ${from}`;
+	}
+	const to = descriptor.upstream.operations
+		.map((operation) => `${descriptor.upstream.protocol}/${operation}`)
+		.join(', ');
+	return ` · ${from} → ${to}`;
 }
 
 /** 返回能精确连接当前对外端点与上游目标的 adapter。 */
@@ -1162,10 +1344,16 @@ export function createInitialRouteForm(models: GatewayModel[], presetModelId?: s
 		priority: 0,
 		weight: 1,
 		custom_params_json: '',
+		custom_headers: emptyCustomHeaderRows(),
+		custom_params_force_override_headers: false,
+		custom_params_force_override_body: false,
 		route_group: 'default',
 		charged_factor: '1',
 		metered_factor: '1',
-		schedule_windows: [],
+		schedule_windows: alignRouteScheduleWindowsToCatalog(
+			catalogScheduleWindowsFromModel(presetModel),
+			[]
+		),
 	};
 }
 
@@ -1186,10 +1374,16 @@ export type ScheduleWindowGroup = {
 	factor: number;
 };
 
+function formatScheduleRangeWithDays(start: string, end: string, days?: number[]): string {
+	const range = formatScheduleRange(start, end);
+	const daysHint = formatIsoWeekdaysHint(days);
+	return daysHint ? `${daysHint} ${range}` : range;
+}
+
 export function groupScheduleWindows(windows: DailyScheduleWindow[]): ScheduleWindowGroup[] {
 	const groups: ScheduleWindowGroup[] = [];
 	for (const w of windows) {
-		const range = formatScheduleRange(w.start, w.end);
+		const range = formatScheduleRangeWithDays(w.start, w.end, w.days);
 		const last = groups[groups.length - 1];
 		if (last && last.factor === w.factor) {
 			last.ranges.push(range);
@@ -1201,7 +1395,9 @@ export function groupScheduleWindows(windows: DailyScheduleWindow[]): ScheduleWi
 }
 
 export function scheduleWindowShapeKey(windows: DailyScheduleWindow[]): string {
-	return windows.map((w) => `${w.start.slice(0, 5)}|${w.end.slice(0, 5)}`).join(',');
+	return windows
+		.map((w) => `${w.start.slice(0, 5)}|${w.end.slice(0, 5)}|${(w.days ?? []).join('.')}`)
+		.join(',');
 }
 
 /** Format schedule windows for tooltips, e.g. `9:00-12:00, 14:00-18:00 ×2`. */
@@ -1230,7 +1426,7 @@ export function formatSharedScheduleWindowsHint(windows: SharedScheduleWindow[])
 	if (windows.length === 0) return null;
 	return windows
 		.map((w) => {
-			const range = formatScheduleRange(w.start, w.end);
+			const range = formatScheduleRangeWithDays(w.start, w.end, w.days);
 			const same = w.charged_factor === w.metered_factor;
 			if (same) {
 				return `${range} ${formatFactorMultiplier(w.charged_factor)}`;

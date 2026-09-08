@@ -3,7 +3,7 @@
  * (including OpenAI/Anthropic `model` field) or Agent Tools (`/v1/tools/*`).
  */
 import { applyGeminiStreamQueryParams } from "@octafuse/core/gemini-upstream-url";
-import type { ImageOperation } from "@/lib/image-generations";
+import { openaiEditImageFormField, type ImageOperation } from "@/lib/image-generations";
 import {
 	parseGatewayToolId,
 	proxyToolPath,
@@ -58,6 +58,8 @@ export type BuildSimulatorRequestInput = {
 	audioOperation?: AudioOperation;
 	/** Required when `audioOperation === 'transcriptions'`: audio file for multipart. */
 	audioFile?: File | null;
+	/** DashScope 客户端 operation；`audio.transcriptions.multimodal` 走同步 HTTP，其余实时 WSS。 */
+	dashscopeRequestOperation?: string;
 };
 
 export type BuildSimulatorRequestResult = {
@@ -188,6 +190,7 @@ export function buildSimulatorRequest(
 				);
 				appendOptionalFormField(fd, "prompt", input.body.prompt);
 				appendOptionalFormField(fd, "temperature", input.body.temperature);
+				appendOptionalFormField(fd, "file_url", input.body.file_url);
 				const fileLines: string[] = [];
 				if (file) {
 					fd.append("file", file, file.name || "audio.webm");
@@ -199,9 +202,14 @@ export function buildSimulatorRequest(
 					fieldParts.push("response_format");
 				if (input.body.prompt != null) fieldParts.push("prompt");
 				if (input.body.temperature != null) fieldParts.push("temperature");
-				const fileSummary = !file
-					? "file: (none selected yet — required before Send)"
-					: [`file:`, ...fileLines.map((l) => `  - ${l}`)].join("\n");
+				if (input.body.file_url != null) fieldParts.push("file_url");
+				const fileUrl =
+					typeof input.body.file_url === "string" ? input.body.file_url.trim() : "";
+				const fileSummary = fileUrl
+					? `file_url: ${fileUrl}`
+					: !file
+						? "file: (none selected yet — required before Send)"
+						: [`file:`, ...fileLines.map((l) => `  - ${l}`)].join("\n");
 				const path = resolveProxyPathForModelInvoke({
 					kind: "audio",
 					protocol: "openai",
@@ -232,8 +240,9 @@ export function buildSimulatorRequest(
 				appendOptionalFormField(fd, "quality", input.body.quality);
 				appendOptionalFormField(fd, "background", input.body.background);
 				const fileLines: string[] = [];
+				const imageField = openaiEditImageFormField(files.length);
 				for (const file of files) {
-					fd.append("image", file, file.name || "image.png");
+					fd.append(imageField, file, file.name || "image.png");
 					fileLines.push(`${file.name || "image.png"} (${file.size} bytes)`);
 				}
 				const fieldParts = ["model", "prompt"];
@@ -319,10 +328,27 @@ export function buildSimulatorRequest(
 				bodyText: JSON.stringify(input.body),
 			};
 		}
-		case "dashscope":
+		case "dashscope": {
+			if (input.dashscopeRequestOperation === "audio.transcriptions.multimodal") {
+				const path = resolveProxyPathForModelInvoke({
+					kind: "audio",
+					protocol: "dashscope",
+					audioOperation: "transcriptions",
+				});
+				const merged = { ...input.body, model: input.modelForRouting };
+				return {
+					url: `${base}${path}`,
+					headers: {
+						"Content-Type": "application/json",
+						Authorization: auth,
+					},
+					bodyText: JSON.stringify(merged),
+				};
+			}
 			throw new Error(
 				"DashScope realtime requests must use the WebSocket simulator path"
 			);
+		}
 		default: {
 			const _exhaustive: never = input.protocol;
 			throw new Error(`Unsupported protocol: ${String(_exhaustive)}`);

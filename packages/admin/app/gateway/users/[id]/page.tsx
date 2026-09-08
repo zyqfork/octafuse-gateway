@@ -8,23 +8,29 @@ import { useTranslations } from 'next-intl';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { ClipboardDocumentIcon, MagnifyingGlassIcon, PlusIcon, TrashIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { InfoHintPopover } from '@/components/InfoHintPopover';
+import { useFeedback } from '@/components/feedback';
 import { readApiJson } from '@/lib/api-json';
 import { parseGatewayDateTime } from '@/lib/datetime';
-import { formatGatewayMoneyCode, formatGatewayMoneyCodeSigned, getGatewayCurrencySymbol } from '@/lib/format-gateway-currency';
+import { formatGatewayMoneyCode, getGatewayCurrencySymbol } from '@/lib/format-gateway-currency';
 import { ModelVendorIcon } from '@/components/model-vendor-icon';
 import { getModelVendorLabel, normalizeModelVendorInput } from '@/lib/model-vendor';
-import type { GatewayApiKeyBudgetAuditLog, GatewayModel, GatewayRequestLog } from '@/lib/types';
-import { GATEWAY_MONEY_DECIMAL_PLACES } from '@/lib/gateway-money';
+import {
+  API_KEY_BUDGET_AUDIT_EVENT_TYPES,
+  type GatewayApiKeyBudgetAuditLog,
+  type GatewayModel,
+  type GatewayRequestLog,
+} from '@/lib/types';
 import { NewApiKeySecretBanner } from '@/lib/new-api-key-secret-banner';
 import { normalizeMetadataClient } from '@/lib/normalize-metadata-client';
 import { useBillingCurrency } from '@/lib/use-billing-currency';
 import { useGatewayDateTime } from '@/lib/use-gateway-datetime';
-import { summarizeUserSnapshotDiffLines } from '@/lib/audit-user-snapshot-diff';
+import { AuditChangeDetailModal, AuditLogSharedCells } from '@/components/AuditLogSharedCells';
 import { summarizeMetadata } from '@/lib/summarize-metadata';
 import { normalizeRouteGroup, routeGroupBadgeClass } from '@/lib/route-group-ui';
 
-/** 与「Δ spend」「budget_max」列重复，不在「User snapshot Δ」再展示 */
-const OMIT_USER_AUDIT_SNAPSHOT_NEIGHBOR_FIELDS = ['budget_spent', 'budget_max'] as const;
+/** 用户详情近期审计与全站页默认一致：不含用量扣费 */
+const USER_DETAIL_AUDIT_EVENT_TYPES = API_KEY_BUDGET_AUDIT_EVENT_TYPES.filter((type) => type !== 'usage_charge');
 
 type ChargedCostFactorRow = { modelId: string; factor: string };
 
@@ -45,9 +51,13 @@ type UserDetail = {
   budget_spent: number;
   budget_period: string;
   budget_reset_at: string | null;
+  wallet_granted?: number;
+  wallet_spent?: number;
+  wallet_balance?: number;
   status: string;
   metadata: Record<string, unknown> | null;
   charged_cost_factors?: Record<string, number> | null;
+  rate_limit?: { rpm?: number } | null;
   created_at: string;
   updated_at: string;
 };
@@ -82,6 +92,7 @@ type KeyRow = {
   status: string;
   metadata: string | null;
   last_used_at: string | null;
+  rate_limit?: { rpm?: number } | null;
   created_at: string;
   updated_at: string;
 };
@@ -110,10 +121,8 @@ function maskKey(key: string) {
   return `${key.substring(0, 7)}…${key.substring(key.length - 4)}`;
 }
 
-function shortAuditId(id: string | null | undefined): string {
-  if (id == null || id === '') return '—';
-  if (id.length < 14) return id;
-  return `${id.slice(0, 8)}…${id.slice(-4)}`;
+function keyRpm(key: { rate_limit?: { rpm?: number } | null }): number | null {
+  return key.rate_limit?.rpm ?? null;
 }
 
 const USER_DETAIL_RECENT_LIMIT = 5;
@@ -128,6 +137,8 @@ export default function GatewayUserDetailPage() {
   const t = useTranslations('users');
   const tCommon = useTranslations('common');
   const tOptions = useTranslations('options');
+  const tAudit = useTranslations('auditLogs');
+  const { notify, confirm } = useFeedback();
   const params = useParams();
   const userIdRaw = typeof params.id === 'string' ? params.id : '';
   const userId = decodeURIComponent(userIdRaw);
@@ -137,6 +148,7 @@ export default function GatewayUserDetailPage() {
   const [keys, setKeys] = useState<KeyRow[]>([]);
   const [logs, setLogs] = useState<GatewayRequestLog[]>([]);
   const [audits, setAudits] = useState<GatewayApiKeyBudgetAuditLog[]>([]);
+  const [detailLog, setDetailLog] = useState<GatewayApiKeyBudgetAuditLog | null>(null);
   const [planError, setPlanError] = useState('');
   const [planSuccess, setPlanSuccess] = useState('');
   const [isSavingPlan, setIsSavingPlan] = useState(false);
@@ -156,10 +168,13 @@ export default function GatewayUserDetailPage() {
     budget_spent: '',
     budget_period: 'none',
     budget_reset_at: '',
+    wallet_granted: '',
+    wallet_spent: '',
     metadata: '',
     chargedCostFactorRows: [] as ChargedCostFactorRow[],
     external_system: '',
     external_user_id: '',
+    rateLimitRpm: '',
   });
   const [showNewKey, setShowNewKey] = useState(false);
   const [freshApiKey, setFreshApiKey] = useState<string | null>(null);
@@ -171,7 +186,7 @@ export default function GatewayUserDetailPage() {
   const [metaViewKey, setMetaViewKey] = useState<KeyRow | null>(null);
   const [isKeySaving, setIsKeySaving] = useState(false);
   const { currency: billingCurrency } = useBillingCurrency();
-  const { formatDateTime } = useGatewayDateTime();
+  const { formatDateTime, businessTimezone } = useGatewayDateTime();
   const billingCurrencySym = getGatewayCurrencySymbol(billingCurrency);
 
   const loadUser = useCallback(async () => {
@@ -195,10 +210,13 @@ export default function GatewayUserDetailPage() {
         budget_spent: String(u.budget_spent ?? 0),
         budget_period: u.budget_period || 'none',
         budget_reset_at: formatLocalDateTimeInput(u.budget_reset_at),
+        wallet_granted: String(u.wallet_granted ?? 0),
+        wallet_spent: String(u.wallet_spent ?? 0),
         metadata: u.metadata ? JSON.stringify(u.metadata, null, 2) : '',
         chargedCostFactorRows: factorsToRows(u.charged_cost_factors),
         external_system: u.external_system ?? '',
         external_user_id: u.external_user_id ?? '',
+        rateLimitRpm: u.rate_limit?.rpm == null ? '' : String(u.rate_limit.rpm),
       });
     } catch (e) {
       console.error(e);
@@ -234,8 +252,15 @@ export default function GatewayUserDetailPage() {
   const loadAudits = useCallback(async () => {
     if (!userId) return;
     try {
-      const q = new URLSearchParams({ page: '1', page_size: String(USER_DETAIL_RECENT_LIMIT) });
-      const res = await fetch(`/api/admin/users/${encodeURIComponent(userId)}/audit-logs?${q}`);
+      const q = new URLSearchParams({
+        page: '1',
+        page_size: String(USER_DETAIL_RECENT_LIMIT),
+        user_id: userId,
+      });
+      for (const eventType of USER_DETAIL_AUDIT_EVENT_TYPES) {
+        q.append('event_type', eventType);
+      }
+      const res = await fetch(`/api/admin/budget-audit-logs?${q}`);
       const data = await readApiJson<GatewayApiKeyBudgetAuditLog[]>(res);
       if (data.success) {
         setAudits(data.data ?? []);
@@ -295,6 +320,14 @@ export default function GatewayUserDetailPage() {
     () => new Set(planForm.chargedCostFactorRows.map((row) => row.modelId)),
     [planForm.chargedCostFactorRows]
   );
+
+  const walletPreviewBalance = useMemo(() => {
+    const granted = Number(planForm.wallet_granted);
+    const spent = Number(planForm.wallet_spent);
+    const g = Number.isFinite(granted) ? granted : 0;
+    const s = Number.isFinite(spent) ? spent : 0;
+    return g - s;
+  }, [planForm.wallet_granted, planForm.wallet_spent]);
 
   const pickerModelsByVendor = useMemo(() => {
     const q = modelPickerSearch.trim().toLowerCase();
@@ -386,6 +419,13 @@ export default function GatewayUserDetailPage() {
         setIsSavingPlan(false);
         return;
       }
+      const rpmRaw = planForm.rateLimitRpm.trim();
+      const rpmParsed = rpmRaw === '' ? null : Number(rpmRaw);
+      if (rpmRaw !== '' && (rpmParsed == null || !Number.isFinite(rpmParsed) || rpmParsed < 0 || !Number.isInteger(rpmParsed))) {
+        setPlanError(t('help.rateLimitRpmInvalid'));
+        setIsSavingPlan(false);
+        return;
+      }
       const payload: Record<string, unknown> = {
         email,
         status: planForm.status,
@@ -394,6 +434,9 @@ export default function GatewayUserDetailPage() {
         budget_spent: parseFloat(planForm.budget_spent) || 0,
         budget_period: planForm.budget_period,
         budget_reset_at: planForm.budget_reset_at ? new Date(planForm.budget_reset_at).toISOString() : null,
+        wallet_granted: parseFloat(planForm.wallet_granted) || 0,
+        wallet_spent: parseFloat(planForm.wallet_spent) || 0,
+        rate_limit: rpmParsed == null ? null : { rpm: rpmParsed },
         external_system: extS || null,
         external_user_id: extU || null,
         reason: 'gwui:user-plan',
@@ -461,18 +504,24 @@ export default function GatewayUserDetailPage() {
   };
 
   const deleteUser = async () => {
-    if (!window.confirm(t('confirm.deleteUser'))) return;
+    const ok = await confirm({
+      title: tCommon('delete'),
+      message: t('confirm.deleteUser'),
+      confirmLabel: tCommon('delete'),
+      danger: true,
+    });
+    if (!ok) return;
     try {
       const res = await fetch(`/api/admin/users/${encodeURIComponent(userId)}`, { method: 'DELETE' });
       const data = await readApiJson(res);
       if (data.success) {
         window.location.href = '/gateway/users';
       } else {
-        alert(data.message || t('errors.deleteFailed'));
+        notify('error', data.message || t('errors.deleteFailed'));
       }
     } catch (e) {
       console.error(e);
-      alert(t('errors.deleteFailed'));
+      notify('error', t('errors.deleteFailed'));
     }
   };
 
@@ -551,7 +600,13 @@ export default function GatewayUserDetailPage() {
   };
 
   const deleteKeyHard = async (keyId: string) => {
-    if (!window.confirm(t('confirm.deleteKey'))) return;
+    const ok = await confirm({
+      title: tCommon('delete'),
+      message: t('confirm.deleteKey'),
+      confirmLabel: tCommon('delete'),
+      danger: true,
+    });
+    if (!ok) return;
     try {
       const res = await fetch(
         `/api/admin/users/${encodeURIComponent(userId)}/keys/${encodeURIComponent(keyId)}`,
@@ -559,10 +614,10 @@ export default function GatewayUserDetailPage() {
       );
       const data = await readApiJson(res);
       if (data.success) loadKeys();
-      else alert(data.message || tCommon('failed'));
+      else notify('error', data.message || tCommon('failed'));
     } catch (e) {
       console.error(e);
-      alert(tCommon('failed'));
+      notify('error', tCommon('failed'));
     }
   };
 
@@ -640,107 +695,175 @@ export default function GatewayUserDetailPage() {
                   <option value="active">{tOptions('userStatus.active')}</option>
                   <option value="disabled">{tOptions('userStatus.disabled')}</option>
                 </select>
-                <p className="mt-1 text-xs text-gray-500">
-                  {t('help.disabledUser')}
-                </p>
               </div>
             </div>
-            <div className="grid gap-3 sm:grid-cols-3">
+            <div className="rounded-lg border border-sky-200 bg-sky-50/70 p-4 space-y-3">
+              <div className="flex items-center gap-1.5">
+                <h3 className="text-sm font-semibold text-sky-950">{t('table.budget')}</h3>
+                <InfoHintPopover label={t('hints.budgetTitle')}>
+                  <p>{t('hints.budgetVsWallet')}</p>
+                </InfoHintPopover>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-3">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    {t('fields.budgetMax')} <span className="ml-1 text-xs font-normal text-gray-400">{tCommon('optional')}</span>
+                  </label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    value={planForm.budget_max}
+                    onChange={(e) => setPlanForm({ ...planForm, budget_max: e.target.value })}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md bg-white text-sm"
+                    placeholder={tCommon('noLimit')}
+                  />
+                  <p className="mt-1 text-xs text-gray-500">
+                    {t('help.budgetMax')}
+                  </p>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    {t('fields.budgetBase')} <span className="ml-1 text-xs font-normal text-gray-400">{tCommon('optional')}</span>
+                  </label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    value={planForm.budget_base}
+                    onChange={(e) => setPlanForm({ ...planForm, budget_base: e.target.value })}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md bg-white text-sm"
+                    placeholder={tCommon('optional')}
+                  />
+                  <p className="mt-1 text-xs text-gray-500">
+                    {t('help.budgetBase')}
+                  </p>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">{t('fields.budgetSpent')}</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    value={planForm.budget_spent}
+                    onChange={(e) => setPlanForm({ ...planForm, budget_spent: e.target.value })}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md bg-white text-sm"
+                  />
+                  <p className="mt-1 text-xs text-gray-500">
+                    {t('help.budgetSpent')}
+                  </p>
+                </div>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-3">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    {t('fields.budgetPeriod')} <span className="ml-1 text-xs font-normal text-gray-400">{tCommon('optional')}</span>
+                  </label>
+                  <select
+                    value={planForm.budget_period}
+                    onChange={(e) => setPlanForm({ ...planForm, budget_period: e.target.value })}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md bg-white text-sm"
+                  >
+                    <option value="none">{tOptions('budgetPeriod.none')}</option>
+                    <option value="daily">{tOptions('budgetPeriod.daily')}</option>
+                    <option value="weekly">{tOptions('budgetPeriod.weekly')}</option>
+                    <option value="monthly">{tOptions('budgetPeriod.monthly')}</option>
+                  </select>
+                  <p className="mt-1 text-xs text-gray-500">
+                    {t('help.budgetPeriod')}
+                  </p>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    {t('fields.budgetResetAt')} <span className="ml-1 text-xs font-normal text-gray-400">{tCommon('optional')}</span>
+                  </label>
+                  <input
+                    type="datetime-local"
+                    step={1}
+                    value={planForm.budget_reset_at}
+                    onChange={(e) => setPlanForm({ ...planForm, budget_reset_at: e.target.value })}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md bg-white text-sm"
+                  />
+                  <p className="mt-1 text-xs text-gray-500">
+                    {t('help.budgetResetAt')}
+                  </p>
+                </div>
+              </div>
+            </div>
+            <div className="rounded-lg border border-violet-200 bg-violet-50/70 p-4 space-y-3">
+              <div className="flex items-center gap-1.5">
+                <h3 className="text-sm font-semibold text-violet-950">{t('table.wallet')}</h3>
+                <InfoHintPopover label={t('hints.walletTitle')}>
+                  <p>{t('hints.budgetVsWallet')}</p>
+                </InfoHintPopover>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-3">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">{t('fields.walletGranted')}</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    value={planForm.wallet_granted}
+                    onChange={(e) => setPlanForm({ ...planForm, wallet_granted: e.target.value })}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md bg-white text-sm"
+                  />
+                  <p className="mt-1 text-xs text-gray-500">{t('help.walletGranted')}</p>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">{t('fields.walletSpent')}</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    value={planForm.wallet_spent}
+                    onChange={(e) => setPlanForm({ ...planForm, wallet_spent: e.target.value })}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md bg-white text-sm"
+                  />
+                  <p className="mt-1 text-xs text-gray-500">{t('help.walletSpent')}</p>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">{t('fields.walletBalance')}</label>
+                  <input
+                    type="text"
+                    readOnly
+                    value={formatGatewayMoneyCode(walletPreviewBalance, billingCurrency, 2)}
+                    className={`w-full px-3 py-2 border border-gray-200 rounded-md bg-gray-50 text-sm ${
+                      walletPreviewBalance < 0 ? 'text-red-600' : 'text-gray-700'
+                    }`}
+                  />
+                  <p className="mt-1 text-xs text-gray-500">{t('help.walletBalance')}</p>
+                </div>
+              </div>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-3 items-start">
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">
-                  {t('fields.budgetMax')} <span className="ml-1 text-xs font-normal text-gray-400">{tCommon('optional')}</span>
+                  {t('fields.rateLimitRpm')} <span className="ml-1 text-xs font-normal text-gray-400">{tCommon('optional')}</span>
                 </label>
                 <input
                   type="number"
-                  step="0.01"
-                  value={planForm.budget_max}
-                  onChange={(e) => setPlanForm({ ...planForm, budget_max: e.target.value })}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm"
-                  placeholder={tCommon('noLimit')}
+                  min="0"
+                  step="1"
+                  value={planForm.rateLimitRpm}
+                  onChange={(e) => setPlanForm({ ...planForm, rateLimitRpm: e.target.value })}
+                  placeholder={t('placeholders.rateLimitRpm')}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-md bg-white text-sm"
                 />
-                <p className="mt-1 text-xs text-gray-500">
-                  {t('help.budgetMax')}
-                </p>
+                <p className="mt-1 text-xs text-gray-500">{t('help.rateLimitRpm')}</p>
               </div>
-              <div>
+              <div className="sm:col-span-2">
                 <label className="block text-sm font-medium text-gray-700 mb-1">
-                  {t('fields.budgetBase')} <span className="ml-1 text-xs font-normal text-gray-400">{tCommon('optional')}</span>
+                  {t('fields.metadataJsonObject')} <span className="ml-1 text-xs font-normal text-gray-400">{tCommon('optional')}</span>
                 </label>
-                <input
-                  type="number"
-                  step="0.01"
-                  value={planForm.budget_base}
-                  onChange={(e) => setPlanForm({ ...planForm, budget_base: e.target.value })}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm"
-                  placeholder={tCommon('optional')}
+                <textarea
+                  value={planForm.metadata}
+                  onChange={(e) => setPlanForm({ ...planForm, metadata: e.target.value })}
+                  rows={6}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-md font-mono text-xs"
+                  placeholder="{}"
                 />
                 <p className="mt-1 text-xs text-gray-500">
-                  {t('help.budgetBase')}
+                  {t('help.metadataReplace')}
                 </p>
               </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">{t('fields.budgetSpent')}</label>
-                <input
-                  type="number"
-                  step="0.01"
-                  value={planForm.budget_spent}
-                  onChange={(e) => setPlanForm({ ...planForm, budget_spent: e.target.value })}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm"
-                />
-                <p className="mt-1 text-xs text-gray-500">
-                  {t('help.budgetSpent')}
-                </p>
-              </div>
-            </div>
-            <div className="grid gap-3 sm:grid-cols-3">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  {t('fields.budgetPeriod')} <span className="ml-1 text-xs font-normal text-gray-400">{tCommon('optional')}</span>
-                </label>
-                <select
-                  value={planForm.budget_period}
-                  onChange={(e) => setPlanForm({ ...planForm, budget_period: e.target.value })}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm"
-                >
-                  <option value="none">{tOptions('budgetPeriod.none')}</option>
-                  <option value="daily">{tOptions('budgetPeriod.daily')}</option>
-                  <option value="weekly">{tOptions('budgetPeriod.weekly')}</option>
-                  <option value="monthly">{tOptions('budgetPeriod.monthly')}</option>
-                </select>
-                <p className="mt-1 text-xs text-gray-500">
-                  {t('help.budgetPeriod')}
-                </p>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  {t('fields.budgetResetAt')} <span className="ml-1 text-xs font-normal text-gray-400">{tCommon('optional')}</span>
-                </label>
-                <input
-                  type="datetime-local"
-                  step={1}
-                  value={planForm.budget_reset_at}
-                  onChange={(e) => setPlanForm({ ...planForm, budget_reset_at: e.target.value })}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm"
-                />
-                <p className="mt-1 text-xs text-gray-500">
-                  {t('help.budgetResetAt')}
-                </p>
-              </div>
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                {t('fields.metadataJsonObject')} <span className="ml-1 text-xs font-normal text-gray-400">{tCommon('optional')}</span>
-              </label>
-              <textarea
-                value={planForm.metadata}
-                onChange={(e) => setPlanForm({ ...planForm, metadata: e.target.value })}
-                rows={6}
-                className="w-full px-3 py-2 border border-gray-300 rounded-md font-mono text-xs"
-                placeholder="{}"
-              />
-              <p className="mt-1 text-xs text-gray-500">
-                {t('help.metadataReplace')}
-              </p>
             </div>
             <div className="pt-4 border-t border-gray-200">
               <h3 className="text-sm font-semibold text-gray-900">
@@ -829,7 +952,7 @@ export default function GatewayUserDetailPage() {
               <thead>
                 <tr className="border-b text-xs text-gray-500 uppercase">
                   <th className="py-2 pr-4 text-left">{tCommon('key')}</th>
-                  <th className="py-2 pr-4 text-left">{tCommon('name')}</th>
+                  <th className="py-2 pr-4 text-left" title={t('keysTable.rateLimitHint')}>{t('keysTable.rateLimit')}</th>
                   <th className="py-2 pr-4 text-left">{tCommon('metadata')}</th>
                   <th className="py-2 pr-4 text-left">{tCommon('status')}</th>
                   <th className="py-2 pl-4 text-right whitespace-nowrap w-px">{tCommon('actions')}</th>
@@ -838,14 +961,34 @@ export default function GatewayUserDetailPage() {
               <tbody>
                 {keys.map((k) => (
                   <tr key={k.id} className="border-b border-gray-100">
-                    <td className="py-2 pr-4 font-mono text-xs align-top">
-                      <span title={k.key}>{maskKey(k.key)}</span>
-                      <button type="button" onClick={() => copy(k.key)} className="ml-1 text-gray-400 hover:text-gray-600 align-middle">
-                        <ClipboardDocumentIcon className="h-3.5 w-3.5 inline" />
-                      </button>
-                      <div className="text-gray-400">{shortId(k.id)}</div>
+                    <td className="py-2 pr-4 align-top">
+                      <div className="truncate text-sm font-medium text-gray-900" title={k.name || undefined}>
+                        {k.name?.trim() ? k.name : '—'}
+                      </div>
+                      <div className="mt-0.5 flex min-w-0 items-center gap-1 font-mono text-[11px] text-gray-400">
+                        <span className="min-w-0 truncate" title={k.key}>{maskKey(k.key)}</span>
+                        <button
+                          type="button"
+                          onClick={() => copy(k.key)}
+                          className="shrink-0 rounded p-0.5 text-gray-300 hover:bg-gray-100 hover:text-gray-600"
+                        >
+                          <ClipboardDocumentIcon className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                      <div className="mt-0.5 font-mono text-[11px] text-gray-400">{shortId(k.id)}</div>
                     </td>
-                    <td className="py-2 pr-4 align-top">{k.name || '—'}</td>
+                    <td className="py-2 pr-4 align-top" title={t('keysTable.rateLimitHint')}>
+                      {(() => {
+                        const rpm = keyRpm(k);
+                        return rpm == null ? (
+                          <span className="text-gray-400">{tCommon('noLimit')}</span>
+                        ) : (
+                          <span className={`tabular-nums ${rpm === 0 ? 'text-amber-700' : 'text-gray-900'}`}>
+                            {t('keysTable.rateLimitRpmValue', { rpm })}
+                          </span>
+                        );
+                      })()}
+                    </td>
                     <td className="py-2 pr-4 align-top max-w-xs">
                       {(() => {
                         const m = summarizeMetadata(k.metadata);
@@ -1063,78 +1206,51 @@ export default function GatewayUserDetailPage() {
             {tCommon('more')}
           </Link>
         </div>
-        <div className="overflow-x-auto text-xs">
-          <table className="min-w-full">
-            <thead>
+        <div className="overflow-x-auto">
+          <table className="min-w-full divide-y divide-gray-200 text-sm">
+            <thead className="bg-gray-50">
               <tr className="text-left text-gray-500 border-b">
-                <th className="py-2 pr-2">{tCommon('time')}</th>
-                <th className="py-2 pr-2">{t('table.event')}</th>
-                <th className="py-2 pr-2">{t('table.sourceTrace')}</th>
-                <th className="py-2 pr-2">{t('table.deltaSpend')}</th>
-                <th className="py-2 pr-2">{t('table.budgetMaxChange')}</th>
-                <th className="py-2 pr-2 min-w-[12rem]">{t('table.userSnapshotDelta')}</th>
+                <th className="px-3 py-2 text-xs font-medium uppercase whitespace-nowrap">{tAudit('table.time')}</th>
+                <th className="px-3 py-2 text-xs font-medium uppercase whitespace-nowrap min-w-[11rem] max-w-[15rem]">{tAudit('table.event')}</th>
+                <th className="px-3 py-2 text-xs font-medium uppercase whitespace-nowrap min-w-[8.5rem] max-w-[12rem]">{tAudit('table.actor')}</th>
+                <th className="px-3 py-2 text-xs font-medium uppercase min-w-[14rem]">{tAudit('table.budget')}</th>
+                <th className="px-3 py-2 text-xs font-medium uppercase min-w-[12rem]">{tAudit('table.periodPlan')}</th>
+                <th className="px-3 py-2 text-xs font-medium uppercase min-w-[14rem]">{tAudit('table.wallet')}</th>
+                <th className="px-3 py-2 text-xs font-medium uppercase min-w-[16rem]">{tAudit('table.userChangeDetail')}</th>
               </tr>
             </thead>
-            <tbody>
-              {audits.map((a) => {
-                const snapLines = summarizeUserSnapshotDiffLines({
-                  before_user_snapshot: a.before_user_snapshot ?? null,
-                  after_user_snapshot: a.after_user_snapshot ?? null,
-                  changed_fields: a.changed_fields ?? null,
-                  omitSnapshotFields: OMIT_USER_AUDIT_SNAPSHOT_NEIGHBOR_FIELDS,
-                });
-                return (
-                <tr key={a.id} className="border-b border-gray-50 align-top">
-                  <td className="py-2 pr-2 whitespace-nowrap">{formatDateTime(a.created_at)}</td>
-                  <td className="py-2 pr-2">
-                    <div className="font-medium">{a.event_type}</div>
-                    <div className="text-gray-500 mt-0.5">{a.actor_type}</div>
-                    {(a.reason_code || a.reason_text) ? (
-                      <div className="text-gray-600 mt-0.5 max-w-[14rem] line-clamp-2" title={a.reason_text ?? a.reason_code ?? ''}>
-                        {a.reason_text || a.reason_code}
-                      </div>
-                    ) : null}
-                  </td>
-                  <td className="py-2 pr-2 font-mono text-[11px] text-gray-700">
-                    {a.source ? <div className="text-violet-800">{a.source}</div> : <span className="text-gray-400">—</span>}
-                    {a.correlation_id ? (
-                      <div className="mt-0.5 text-gray-500" title={a.correlation_id}>corr {shortAuditId(a.correlation_id)}</div>
-                    ) : a.request_log_id ? (
-                      <div className="mt-0.5 text-gray-500" title={a.request_log_id}>req {shortAuditId(a.request_log_id)}</div>
-                    ) : null}
-                  </td>
-                  <td className="py-2 pr-2">{formatGatewayMoneyCodeSigned(a.delta_spent, billingCurrency, GATEWAY_MONEY_DECIMAL_PLACES)}</td>
-                  <td className="py-2 pr-2 font-mono">
-                    {a.before_budget_max != null ? formatGatewayMoneyCode(a.before_budget_max, billingCurrency, 2) : '—'}
-                    {' → '}
-                    {a.after_budget_max != null ? formatGatewayMoneyCode(a.after_budget_max, billingCurrency, 2) : '—'}
-                  </td>
-                  <td className="py-2 pr-2 text-gray-600">
-                    <div className="space-y-0.5">
-                      {snapLines.length === 0 ? (
-                        <span className="text-gray-400">—</span>
-                      ) : (
-                        <>
-                          {snapLines.slice(0, 5).map((line, i) => (
-                            <div key={`${a.id}-s-${i}`} className="line-clamp-2 font-mono text-[11px]" title={line}>
-                              {line}
-                            </div>
-                          ))}
-                          {snapLines.length > 5 ? (
-                            <div className="text-gray-400 text-[11px]">{t('detailSections.moreCount', { count: snapLines.length - 5 })}</div>
-                          ) : null}
-                        </>
-                      )}
-                    </div>
+            <tbody className="divide-y divide-gray-100">
+              {audits.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="px-4 py-8 text-center text-gray-500">
+                    {t('empty.auditLogs')}
                   </td>
                 </tr>
-                );
-              })}
+              ) : (
+                audits.map((a) => (
+                  <tr key={a.id} className="align-top hover:bg-gray-50">
+                    <AuditLogSharedCells
+                      item={a}
+                      currency={billingCurrency}
+                      timezone={businessTimezone}
+                      onViewDetail={setDetailLog}
+                      showIdentity={false}
+                    />
+                  </tr>
+                ))
+              )}
             </tbody>
           </table>
-          {audits.length === 0 && <p className="text-sm text-gray-500 py-4">{t('empty.auditLogs')}</p>}
         </div>
       </div>
+
+      {detailLog ? (
+        <AuditChangeDetailModal
+          item={detailLog}
+          timezone={businessTimezone}
+          onClose={() => setDetailLog(null)}
+        />
+      ) : null}
 
       {showModelPicker && (
         <div

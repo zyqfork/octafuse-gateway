@@ -1,9 +1,12 @@
 import {
 	AUDIO_SPEECH_BODY_TEMPLATE,
 	AUDIO_TRANSCRIPTIONS_BODY_TEMPLATE,
+	AUDIO_TRANSCRIPTIONS_FILE_URL_BODY_TEMPLATE,
+	DASHSCOPE_MULTIMODAL_ASR_BODY_TEMPLATE,
 	isAudioRouteModel,
 } from '@/lib/audio-transcriptions';
 import { isAudioTranscriptionModel } from '@octafuse/core/db/model-modalities';
+import { extraHeadersFromCustomParams, mergeRouteRequestBody, mergeUpstreamHeaders, splitRouteCustomParams } from '@octafuse/core/route-custom-params';
 import {
 	IMAGE_EDITS_BODY_TEMPLATE,
 	IMAGE_GENERATIONS_BODY_TEMPLATE,
@@ -114,6 +117,130 @@ export function decodeWireRequestBodyHeader(res: Response, decodeFailedLabel: st
 	}
 }
 
+type JsonObject = Record<string, unknown>;
+
+function isPlainJsonObject(value: unknown): value is JsonObject {
+	return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function parseCustomParamsObject(raw?: string | null): JsonObject {
+	const text = raw?.trim() ?? '';
+	if (!text) return {};
+	try {
+		const parsed = JSON.parse(text) as unknown;
+		return isPlainJsonObject(parsed) ? parsed : {};
+	} catch {
+		return {};
+	}
+}
+
+export function splitPlaygroundCustomParams(customParams?: string | null) {
+	return splitRouteCustomParams(parseCustomParamsObject(customParams));
+}
+
+/** 路由 `custom_params.headers` 预览（已跳过受保护头，与出站 merge 一致）。 */
+export function previewPlaygroundRouteHeaders(customParams?: string | null): Record<string, string> {
+	return extraHeadersFromCustomParams(parseCustomParamsObject(customParams));
+}
+
+export function formatPlaygroundRouteHeadersPreview(headers: Record<string, string>): string {
+	return Object.entries(headers)
+		.map(([name, value]) => `${name}: ${value}`)
+		.join('\n');
+}
+
+export type PlaygroundHeaderSource = 'provider' | 'custom_params';
+
+export type PlaygroundHeaderPreviewRow = {
+	name: string;
+	value: string;
+	source: PlaygroundHeaderSource;
+};
+
+/** 本地预览用的协议默认头（密钥占位）；发送后以服务端回传为准。 */
+export function typicalPlaygroundDriverHeaders(protocol?: string | null): Record<string, string> {
+	switch (normalizeProtocol(protocol ?? 'openai')) {
+		case 'anthropic':
+			return {
+				'Content-Type': 'application/json',
+				'x-api-key': '••••••••',
+				'anthropic-version': '2023-06-01',
+			};
+		case 'gemini':
+			return {
+				'Content-Type': 'application/json',
+				Authorization: 'Bearer ••••••••',
+			};
+		default:
+			return {
+				'Content-Type': 'application/json',
+				Authorization: 'Bearer ••••••••',
+			};
+	}
+}
+
+function extraHeaderNameSet(extra: Record<string, string>): Set<string> {
+	return new Set(Object.keys(extra).map((name) => name.toLowerCase()));
+}
+
+/**
+ * 出站请求头预览：驱动默认头 + 路由 `custom_params.headers`。
+ * 传入 `sentHeaders` 时用发送后的实际上游头（已脱敏），仍按 custom_params 标注来源。
+ */
+export function previewPlaygroundOutboundHeaderRows(input: {
+	customParams?: string | null;
+	upstreamProtocol?: string | null;
+	sentHeaders?: Record<string, string> | null;
+}): PlaygroundHeaderPreviewRow[] {
+	const extra = previewPlaygroundRouteHeaders(input.customParams);
+	const extraNames = extraHeaderNameSet(extra);
+	const sent = input.sentHeaders;
+	const display =
+		sent && Object.keys(sent).length > 0
+			? sent
+			: mergeUpstreamHeaders(typicalPlaygroundDriverHeaders(input.upstreamProtocol), extra);
+	return Object.entries(display)
+		.map(([name, value]) => ({
+			name,
+			value,
+			source: (extraNames.has(name.toLowerCase()) ? 'custom_params' : 'provider') as PlaygroundHeaderSource,
+		}))
+		.sort((a, b) => {
+			if (a.source === b.source) return 0;
+			return a.source === 'provider' ? -1 : 1;
+		});
+}
+
+export type PlaygroundMergedBodyPreview = { status: 'invalid' } | { status: 'preview'; json: string };
+
+/** 与 Proxy / Playground 服务端相同：custom_params 与用户体深度合并。 */
+export function previewPlaygroundMergedBody(input: {
+	bodyText: string;
+	customParams?: string | null;
+	upstreamProtocol?: string | null;
+	providerModelName?: string | null;
+}): PlaygroundMergedBodyPreview {
+	let userBody: unknown;
+	try {
+		userBody = JSON.parse(input.bodyText);
+	} catch {
+		return { status: 'invalid' };
+	}
+	if (!isPlainJsonObject(userBody)) {
+		return { status: 'invalid' };
+	}
+
+	const customParams = parseCustomParamsObject(input.customParams);
+	const merged = mergeRouteRequestBody(customParams, userBody);
+	const body: JsonObject = { ...merged };
+	const proto = normalizeProtocol(input.upstreamProtocol ?? 'openai');
+	const model = input.providerModelName?.trim() ?? '';
+	if (model && proto !== 'gemini') {
+		body.model = model;
+	}
+	return { status: 'preview', json: JSON.stringify(body, null, 2) };
+}
+
 export function routeMatchesSearch(route: RouteListRow, query: string): boolean {
 	const needle = query.trim().toLowerCase();
 	if (!needle) return true;
@@ -152,20 +279,31 @@ export function templateForRoute(
 		return route.upstream_operation?.startsWith('audio.speech.')
 			? buildDashScopeRealtimeTtsTemplate(route.provider_model_name)
 			: buildDashScopeRealtimeAsrTemplate(
-					(route.upstream_operation ?? 'audio.transcriptions.realtime.inference') as
-						| 'audio.transcriptions.realtime.inference'
-						| 'audio.transcriptions.realtime.session',
+					route.upstream_operation && isDashScopeRealtimeOperation(route.upstream_operation)
+						? route.upstream_operation
+						: undefined,
 				);
 	}
 	if (isAudio && isAudioHttp) {
-		if (isAudioTranscription) return AUDIO_TRANSCRIPTIONS_BODY_TEMPLATE;
+		if (isAudioTranscription) {
+			if (route.adapter === 'dashscope-asr-file-async' || route.upstream_operation === 'audio.transcriptions.async') {
+				return AUDIO_TRANSCRIPTIONS_FILE_URL_BODY_TEMPLATE;
+			}
+			if (proto === 'dashscope' && route.adapter === 'passthrough') {
+				return DASHSCOPE_MULTIMODAL_ASR_BODY_TEMPLATE;
+			}
+			return AUDIO_TRANSCRIPTIONS_BODY_TEMPLATE;
+		}
 		if (proto === 'dashscope' && route.upstream_operation === 'audio.speech') {
 			return buildDashScopeSpeechBodyTemplate(route.provider_model_name);
 		}
 		return AUDIO_SPEECH_BODY_TEMPLATE;
 	}
-	if (isImage && proto === 'openai') {
-		return imageOperation === 'edits' ? IMAGE_EDITS_BODY_TEMPLATE : IMAGE_GENERATIONS_BODY_TEMPLATE;
+	if (isImage && (proto === 'openai' || proto === 'dashscope')) {
+		if (proto === 'dashscope' || imageOperation !== 'edits') {
+			return IMAGE_GENERATIONS_BODY_TEMPLATE;
+		}
+		return IMAGE_EDITS_BODY_TEMPLATE;
 	}
 	const family = resolvePlaygroundLlmFamily(route);
 	if (family) {

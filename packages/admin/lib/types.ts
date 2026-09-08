@@ -20,9 +20,13 @@ export interface GatewayApiKey {
   budget_spent: number;
   budget_period: string;
   budget_reset_at: string | null;
+  wallet_granted?: number;
+  wallet_spent?: number;
   status: string;
   /** JSON string; extensible key data (e.g. plan), surfaced on GET /v1/me */
   metadata: string | null;
+  last_used_at?: string | null;
+  rate_limit?: { rpm?: number } | null;
   created_at: string;
   updated_at: string;
 }
@@ -76,10 +80,14 @@ export interface GatewayUserListItem {
   budget_spent: number;
   budget_period: string;
   budget_reset_at: string | null;
+  wallet_granted?: number;
+  wallet_spent?: number;
   status: string;
   metadata: string | null;
   /** 已解析的用户级 Charged cost factors；未配置时为 null */
   charged_cost_factors?: Record<string, number> | null;
+  /** 用户层限流；`null` 表示该层不限 */
+  rate_limit?: { rpm?: number } | null;
   created_at: string;
   updated_at: string;
   active_keys_count: number;
@@ -97,6 +105,7 @@ export const API_KEY_BUDGET_AUDIT_EVENT_TYPES = [
   'key_deleted',
   'user_created',
   'user_deleted',
+  'wallet_credit',
 ] as const;
 
 /** 与 octafuse `ApiKeyBudgetAuditActorType` 对齐 */
@@ -120,6 +129,7 @@ export const API_KEY_BUDGET_AUDIT_SOURCE_CHANNELS = [
   'admin_budget_transition',
   'admin_keys',
   'admin_user_key',
+  'admin_wallet',
   'usage_charge',
   'period_reset',
 ] as const;
@@ -131,6 +141,12 @@ export interface GatewayProvider {
   vendor_key?: string;
   /** Admin API 根据内置预设动态推导的产品级图标；不写入 providers 表。 */
   icon_key?: string;
+  /** Admin API 根据内置预设叠加的官网 / 密钥 / 邀请链接；不写入 providers 表。 */
+  catalog_links?: {
+    platform?: string;
+    api_keys?: string;
+    referral?: string;
+  };
   /** 协议端点 JSON；见 `providers.endpoints` */
   endpoints?: string | null;
   /** 脱敏预览；明文仅经 `GET /admin/providers/:id/api-key` */
@@ -187,7 +203,7 @@ export interface GatewayModelRoute {
   /** Route channel: e.g. default, free (gateway migration 0016) */
   route_group: string;
   price_override: string | null;
-  /** JSON object string: route-level request body defaults (merged with client body; client wins) */
+  /** JSON object string: envelope `{ headers, body, force_override }` or legacy flat object */
   custom_params: string | null;
   /** NOT NULL DEFAULT 'openai' after gateway migration 0011 */
   upstream_protocol: string;
@@ -286,6 +302,8 @@ export interface GatewayRequestLog {
   /** 按秒计费：音频时长（秒） */
   audio_duration_seconds?: number | null;
   audio_characters?: number | null;
+  /** Request Host snapshot (observe only); null on legacy rows */
+  ingress_host?: string | null;
   created_at: string;
 }
 
@@ -460,6 +478,8 @@ export interface UserUsageRow extends AnalyticsRowCosts {
   last_active_at: string | null;
   budget_max: number | null;
   budget_spent: number;
+  wallet_granted?: number | null;
+  wallet_spent?: number | null;
   budget_usage_rate: number | null;
   success_rate: number;
   error_count: number;

@@ -51,10 +51,11 @@ const LLM_PROFILE = JSON.stringify({
 	tiers: [{ upto: null, input_price: 2, output_price: 12, cache_read_price: 0.2 }],
 });
 
-function mockRepos(): GatewayRepositories {
+function mockRepos(timezone?: string): GatewayRepositories {
 	return {
 		systemConfig: {
-			getConfig: async () => null,
+			getConfig: async (key: string) =>
+				key === 'BUSINESS_TIMEZONE' ? timezone ?? null : null,
 		},
 	} as unknown as GatewayRepositories;
 }
@@ -206,6 +207,45 @@ describe('estimateImageCosts', () => {
 		assert.ok(Math.abs(override.chargedCost - base.chargedCost * 2) < 1e-9);
 	});
 
+	it('stacks official catalog schedule before route factors', async () => {
+		const profile = JSON.stringify({
+			image_billing_mode: 'per_image',
+			image: { default: 0.04 },
+			schedule: [{ start: '23:00', end: '02:00', factor: 0.5 }],
+		});
+		const route = JSON.stringify({
+			charged_factor: 1,
+			metered_factor: 1,
+			schedule: {
+				mode: 'override',
+				charged: [{ start: '23:00', end: '02:00', factor: 0.8 }],
+				metered: [{ start: '23:00', end: '02:00', factor: 1.2 }],
+			},
+		});
+		const hit = await estimateImageCosts(mockRepos('Asia/Shanghai'), {
+			modelPricingProfileJson: profile,
+			routePriceOverrideJson: route,
+			quality: 'auto',
+			size: 'auto',
+			imageCount: 1,
+			requestStartedAtMs: Date.parse('2026-07-10T15:30:00.000Z'),
+		});
+		assert.equal(hit.standardCost, 0.02);
+		assert.equal(hit.chargedCost, 0.016);
+		assert.equal(hit.meteredCost, 0.024);
+		assert.equal(hit.chargedCost / hit.standardCost, 0.8);
+		const miss = await estimateImageCosts(mockRepos('Asia/Shanghai'), {
+			modelPricingProfileJson: profile,
+			routePriceOverrideJson: route,
+			quality: 'auto',
+			size: 'auto',
+			imageCount: 1,
+			requestStartedAtMs: Date.parse('2026-07-10T18:30:00.000Z'),
+		});
+		assert.equal(miss.standardCost, 0.04);
+		assert.equal(miss.chargedCost, 0.04);
+	});
+
 	it('applies user charged cost factor after route charged cost', async () => {
 		const route = await estimateImageCosts(mockRepos(), {
 			modelPricingProfileJson: PER_IMAGE_PROFILE,
@@ -228,6 +268,27 @@ describe('estimateImageCosts', () => {
 		assert.equal(discounted.meteredCost, route.meteredCost);
 		const audit = JSON.parse(discounted.pricingAuditJson) as { user_charged_factor: number };
 		assert.equal(audit.user_charged_factor, 0.5);
+	});
+
+	it('per_image by_size 2k hits the catalog unit price', async () => {
+		const profile = JSON.stringify({
+			image_billing_mode: 'per_image',
+			image: {
+				default: 0.25,
+				by_size: { '1k': 0.25, '2k': 0.5 },
+			},
+		});
+		const costs = await estimateImageCosts(mockRepos(), {
+			modelPricingProfileJson: profile,
+			routePriceOverrideJson: null,
+			quality: 'auto',
+			size: '2k',
+			imageCount: 1,
+		});
+		assert.equal(costs.billingKind, 'image_per_image');
+		assert.ok(Math.abs(costs.chargedCost - 0.5) < 1e-9);
+		const audit = JSON.parse(costs.pricingAuditJson) as { size: string };
+		assert.equal(audit.size, '2k');
 	});
 
 	it('per_image applies charged_factor from route override', async () => {

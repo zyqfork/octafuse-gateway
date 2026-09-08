@@ -2,7 +2,7 @@
  * OpenAI 兼容 Images API 上游驱动：`/images/generations`（JSON）与 `/images/edits`（multipart）。
  * 首期面向 GPT Image；Gateway 对外保持 OpenAI 形状，日志禁止写入 prompt 原文与 Base64。
  */
-import { parseOpenAiImageUsage, resolveProviderUpstreamSecret, resolveUpstreamEndpoint, type ImageTokenUsage } from '@octafuse/core';
+import { applyRouteExtraHeaders, parseOpenAiImageUsage, resolveProviderUpstreamSecret, resolveUpstreamEndpoint, type ImageTokenUsage } from '@octafuse/core';
 import type { RouteResult } from '../model-router';
 import type { UsageFromStream } from '../proxy';
 import { EMPTY_USAGE } from '../proxy';
@@ -79,11 +79,30 @@ export type NormalizedImageEditRequest = {
 	size?: string;
 	quality?: string;
 	background?: string;
-	/** OpenAI edits 通常用 `image` / 多图 `image[]`；此处统一为数组 */
+	/** OpenAI edits：单图 `image`，多图 `image[]`；此处统一为数组 */
 	images: ImageEditUpload[];
 	/** 透传给上游的其余安全字段（不含 prompt / 文件） */
 	extra?: Record<string, unknown>;
 };
+
+/** OpenAI `/images/edits` 禁止重复标量 `image`；多图必须用 `image[]`。 */
+export type OpenaiEditImageFormField = 'image' | 'image[]';
+
+export function openaiEditImageFormField(count: number): OpenaiEditImageFormField {
+	return count > 1 ? 'image[]' : 'image';
+}
+
+export function isOpenaiEditImageFormKey(key: string): boolean {
+	return key === 'image' || key === 'images' || key === 'image[]';
+}
+
+export function appendOpenaiEditImages(form: FormData, images: readonly ImageEditUpload[]): void {
+	const field = openaiEditImageFormField(images.length);
+	for (const img of images) {
+		const blob = new Blob([img.bytes], { type: img.mimeType });
+		form.append(field, blob, img.filename || 'image.png');
+	}
+}
 
 type ImageAbortReason = 'none' | 'gateway_timeout' | 'client_abort';
 
@@ -134,13 +153,16 @@ function imageAbortErrorPayload(
 }
 
 /** 校验并规范化 generation / edit 公共参数（`n` 接受 number 或数字字符串，如 multipart）。 */
-export function normalizeImageCommonParams(input: {
-	prompt: unknown;
-	n?: unknown;
-	size?: unknown;
-	quality?: unknown;
-	background?: unknown;
-}):
+export function normalizeImageCommonParams(
+	input: {
+		prompt: unknown;
+		n?: unknown;
+		size?: unknown;
+		quality?: unknown;
+		background?: unknown;
+	},
+	options?: { maxN?: number }
+):
 	| { ok: true; prompt: string; n: number; size?: string; quality?: string; background?: string }
 	| { ok: false; error: string } {
 	const prompt = typeof input.prompt === 'string' ? input.prompt.trim() : '';
@@ -151,12 +173,18 @@ export function normalizeImageCommonParams(input: {
 		return { ok: false, error: `prompt must be at most ${IMAGE_MAX_PROMPT_CHARS} characters` };
 	}
 
+	const maxN = options?.maxN != null && Number.isInteger(options.maxN) && options.maxN >= 1
+		? options.maxN
+		: 1;
 	let n = 1;
 	if (input.n !== undefined && input.n !== null && input.n !== '') {
 		const nRaw =
 			typeof input.n === 'string' && input.n.trim() !== '' ? Number(input.n) : input.n;
-		if (typeof nRaw !== 'number' || !Number.isInteger(nRaw) || nRaw !== 1) {
-			return { ok: false, error: 'n must be 1' };
+		if (typeof nRaw !== 'number' || !Number.isInteger(nRaw) || nRaw < 1 || nRaw > maxN) {
+			return {
+				ok: false,
+				error: maxN === 1 ? 'n must be 1' : `n must be an integer between 1 and ${maxN}`,
+			};
 		}
 		n = nRaw;
 	}
@@ -317,10 +345,13 @@ export async function dispatchOpenAiImageGenerations(
 		const { secret } = await resolveProviderUpstreamSecret(route.providerApiKey);
 		const response = await fetch(url, {
 			method: 'POST',
-			headers: {
-				'Content-Type': 'application/json',
-				Authorization: `Bearer ${secret}`,
-			},
+			headers: applyRouteExtraHeaders(
+				{
+					'Content-Type': 'application/json',
+					Authorization: `Bearer ${secret}`,
+				},
+				route.customParams
+			),
 			body: JSON.stringify(requestBody),
 			signal,
 		});
@@ -411,16 +442,12 @@ export async function dispatchOpenAiImageEdits(
 	form.append('model', route.providerModelName);
 	for (const [k, v] of Object.entries(mergedExtras)) {
 		if (v == null) continue;
-		if (k === 'model' || k === 'image' || k === 'images') continue;
+		if (k === 'model' || isOpenaiEditImageFormKey(k)) continue;
 		if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
 			form.append(k, String(v));
 		}
 	}
-	for (const img of edit.images) {
-		// 直接用已有 Uint8Array 构造 Blob，避免再 copy 一份驻留内存
-		const blob = new Blob([img.bytes], { type: img.mimeType });
-		form.append('image', blob, img.filename || 'image.png');
-	}
+	appendOpenaiEditImages(form, edit.images);
 
 	const startedAt = Date.now();
 	const { signal, clear, getAbortReason } = withTimeoutSignal(
@@ -431,9 +458,12 @@ export async function dispatchOpenAiImageEdits(
 		const { secret } = await resolveProviderUpstreamSecret(route.providerApiKey);
 		const response = await fetch(url, {
 			method: 'POST',
-			headers: {
-				Authorization: `Bearer ${secret}`,
-			},
+			headers: applyRouteExtraHeaders(
+				{
+					Authorization: `Bearer ${secret}`,
+				},
+				route.customParams
+			),
 			body: form,
 			signal,
 		});

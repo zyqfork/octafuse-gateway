@@ -31,6 +31,7 @@ import type {
 	RequestTimeseriesRow,
 	ThroughputSnapshot,
 	UserAnalyticsRow,
+	KeyAnalyticsRow,
 	UserTokenTimeseriesRow,
 } from './repository-dtos';
 import type { ResolvedModelSurfaceRow } from '../route-topology';
@@ -72,9 +73,18 @@ export interface AdminAccessRepository {
 
 /** 管理端分析聚合 */
 export interface AdminAnalyticsRepository {
-	queryModelAnalytics(options: { start: string; end: string; tag?: string; providerId?: string; userEmail?: string }): Promise<ModelAnalyticsRow[]>;
+	queryModelAnalytics(options: {
+		start: string;
+		end: string;
+		tag?: string;
+		providerId?: string;
+		userEmail?: string;
+		userId?: string;
+		apiKeyId?: string;
+	}): Promise<ModelAnalyticsRow[]>;
 	queryDistinctModelTags(): Promise<string[]>;
 	queryUserAnalytics(options: { start: string; end: string; email?: string }): Promise<UserAnalyticsRow[]>;
+	queryKeyAnalytics(options: { start: string; end: string; userId: string }): Promise<KeyAnalyticsRow[]>;
 	queryProviderAnalytics(options: { start: string; end: string; tag?: string; modelId?: string; routeGroup?: string }): Promise<ProviderAnalyticsRow[]>;
 	queryProviderReliability(options: { start: string; end: string }): Promise<ProviderReliabilityRow[]>;
 	queryModelProviderReliability(options: { start: string; end: string }): Promise<ModelProviderReliabilityRow[]>;
@@ -85,7 +95,8 @@ export interface UserAuditLogsRepository {
 	getUserAuditLogsByUserId(
 		userId: string,
 		page: number,
-		pageSize: number
+		pageSize: number,
+		eventType?: string
 	): Promise<{ logs: UserAuditLogRow[]; total: number }>;
 	getGlobalUserAuditLogs(options: {
 		page?: number;
@@ -121,6 +132,7 @@ export interface ApiKeysRepository {
 	updateApiKeyStatusById(id: string, status: string): Promise<boolean>;
 	setApiKeyMetadataById(id: string, metadataJson: string | null): Promise<boolean>;
 	updateApiKeyName(id: string, name: string | null): Promise<boolean>;
+	updateApiKeyRateLimit(id: string, rateLimitJson: string | null): Promise<boolean>;
 	getAllApiKeys(options?: {
 		email?: string;
 		userId?: string;
@@ -158,9 +170,12 @@ export interface UsersRepository {
 		resetBudget?: boolean,
 		metadata?: string | null,
 		budget_spent_override?: number | null,
-		budget_base?: number | null
+		budget_base?: number | null,
+		wallet_granted?: number | null,
+		wallet_spent?: number | null
 	): Promise<boolean>;
 	updateUserStatus(id: string, status: string): Promise<boolean>;
+	updateUserRateLimit(id: string, rateLimitJson: string | null): Promise<boolean>;
 	setUserMetadataById(id: string, metadataJson: string | null): Promise<boolean>;
 	setUserChargedCostFactorsById(id: string, chargedCostFactorsJson: string | null): Promise<boolean>;
 	setUserEmailById(id: string, email: string): Promise<boolean>;
